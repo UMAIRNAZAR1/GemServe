@@ -3,11 +3,11 @@ import os
 from datetime import datetime
 
 DB_FILE = "todotasks.db"
-DB_PATH = os.path.join("db", DB_FILE)
+DB_PATH = os.path.join("data", DB_FILE)
 
 def init_database():
     # Make sure the db folder exists
-    os.makedirs("db", exist_ok=True)
+    os.makedirs("data", exist_ok=True)
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -108,3 +108,15 @@ def get_today_or_upcoming_tasks():
         pass
 
     return tasks
+
+# Add this function for deleting a task
+def delete_task(task_id):
+    """Delete a task from the database"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    conn.commit()
+    conn.close()
+    print(f"✅ Task {task_id} deleted")
+
+

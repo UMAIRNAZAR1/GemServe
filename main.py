@@ -30,9 +30,10 @@ class App(QStackedWidget):
             self.open_chatbot_session  # New: open specific session
         )
         self.settings_page = SettingsPage(self.settings_saved)
-        self.todo_page = TodoList(self.go_home)
+        self.todo_page = TodoList(self.go_back_home_and_refresh)
         self.chatbot_page = ChatWindow(self.go_home, self.refresh_home)
 
+        self.home_page.task_status_changed.connect(self.todo_page.refresh_page)
         # Add pages
         self.addWidget(self.home_page)
         self.addWidget(self.settings_page)
@@ -77,6 +78,10 @@ class App(QStackedWidget):
         """Refresh home page chat sessions"""
         self.home_page.refresh_chat_sessions()
     # -------- Dark Mode Functions ---------
+
+    def go_back_home_and_refresh(self):
+        self.home_page.refresh_tasks()
+        self.setCurrentWidget(self.home_page)
 
     def load_dark_mode(self):
         if os.path.exists(DATA_FILE):
