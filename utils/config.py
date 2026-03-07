@@ -13,9 +13,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ==================== LLM SETTINGS ====================
 OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_FAST_MODEL = "gemma3:270m"
-OLLAMA_THINKING_MODEL = "gemma3n:e2b"
-OLLAMA_MODEL = OLLAMA_FAST_MODEL  # backward-compat alias
+OLLAMA_MODEL = "gemma3:270m"  # Main chat model - change to "gemma3n:e2b" if you prefer
 
 # ==================== EMBEDDING SETTINGS ====================
 EMBEDDING_MODEL = "embeddinggemma:latest"
@@ -26,8 +24,11 @@ SYSTEM_PROMPT_TOKENS = 500
 USER_PREFS_TOKENS = 200
 RESERVED_RESPONSE_TOKENS = 8000
 
+# Context limits without files
 MAX_HISTORY_MESSAGES_NO_FILES = 30
 MAX_HISTORY_TOKENS_NO_FILES = 8000
+
+# Context limits with files (RAG enabled)
 MAX_HISTORY_MESSAGES_WITH_FILES = 15
 MAX_HISTORY_TOKENS_WITH_FILES = 4000
 MAX_RAG_CHUNKS = 8

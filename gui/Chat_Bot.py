@@ -170,11 +170,84 @@ class LLMWorker(QThread):
 
     def run(self):
         try:
-            response = get_chat_response(self.session_id, self.user_query, self.mode)
+            response = get_chat_response(self.session_id, self.user_query)
+            # Clean response - remove extra whitespace and newlines
             cleaned_response = response.strip()
             self.finished.emit(cleaned_response)
         except Exception as e:
             self.error.emit(str(e))
+
+
+# ---------------------- FILE PROCESSOR WORKER THREAD -------------------------
+class FileProcessorWorker(QThread):
+    """Background thread for file processing (extraction, chunking, embedding) to keep UI responsive"""
+
+    progress = Signal(int)  # Emits percentage (0-100)
+    status_update = Signal(str)  # Emits status message
+    finished = Signal(bool)  # Emits success status
+    error = Signal(str)  # Emits error message
+
+    def __init__(self, session_id, file_path, file_type, filename):
+        super().__init__()
+        self.session_id = session_id
+        self.file_path = file_path
+        self.file_type = file_type
+        self.filename = filename
+
+    def run(self):
+        try:
+            # Step 1: Save file metadata
+            self.status_update.emit(f"📎 Processing: {self.filename}...")
+            self.progress.emit(10)
+            
+            file_id = save_file_metadata(
+                self.session_id, self.filename, self.file_path, self.file_type
+            )
+            
+            # Step 2: Extract text from file
+            self.status_update.emit(f"📖 Extracting text from {self.filename}...")
+            self.progress.emit(20)
+            chunks = process_file(self.file_path, self.file_type)
+            
+            if not chunks:
+                self.error.emit(f"⚠️ Could not extract text from {self.filename}")
+                self.finished.emit(False)
+                return
+            
+            # Step 3: Generate embeddings with progress tracking
+            self.status_update.emit(f"🔄 Generating embeddings for {len(chunks)} chunks...")
+            self.progress.emit(30)
+            
+            # Define progress callback for embedding generation
+            def embedding_progress(current, total):
+                # Map 30-90% to embedding generation progress
+                percent = 30 + int((current / total) * 60)
+                self.progress.emit(percent)
+            
+            success = add_document_chunks(
+                self.session_id, 
+                file_id, 
+                self.filename, 
+                chunks,
+                progress_callback=embedding_progress
+            )
+            
+            if not success:
+                self.error.emit(f"❌ Failed to process embeddings for {self.filename}")
+                self.finished.emit(False)
+                return
+            
+            # Step 4: Mark file as processed
+            self.status_update.emit(f"✅ Finalizing...")
+            self.progress.emit(95)
+            mark_file_processed(file_id)
+            
+            self.progress.emit(100)
+            self.finished.emit(True)
+            
+        except Exception as e:
+            self.error.emit(f"❌ File processing error: {str(e)}")
+            self.finished.emit(False)
 
 
 # ----------------------- MAIN CHAT WINDOW ------------------------
@@ -187,11 +260,10 @@ class ChatWindow(QWidget):
         self.current_session_id = None
         self.is_new_session = True
         self.llm_worker = None
-
-        # File operation state
-        self.pending_file_action = (
-            None  # Store pending actions (delete, overwrite, create location, etc.)
-        )
+        
+        # File operation mode state
+        self.file_operation_mode = False
+        self.pending_file_action = None  # Store pending actions (delete, overwrite, create location, etc.)
 
         self.setMinimumSize(450, 620)
         self.setup_ui()
@@ -536,8 +608,7 @@ class ChatWindow(QWidget):
         # NORMAL CHAT MODE
         self.add_message("Thinking...", False, save_to_db=False)
 
-        mode = self.get_selected_mode()
-        self.llm_worker = LLMWorker(self.current_session_id, text, mode)
+        self.llm_worker = LLMWorker(self.current_session_id, text)
         self.llm_worker.finished.connect(self.on_llm_response)
         self.llm_worker.error.connect(self.on_llm_error)
         self.llm_worker.start()
@@ -580,13 +651,19 @@ class ChatWindow(QWidget):
             self,
             "Select File",
             "",
-            "Supported Files (*.txt *.md *.pdf);;Text Files (*.txt);;Markdown (*.md);;PDF Files (*.pdf);;All Files (*.*)",
+            "Supported Files (*.txt *.md *.pdf);;Text Files (*.txt);;Markdown (*.md);;PDF Files (*.pdf)",
         )
 
         if not file_path:
             return
 
         filename = os.path.basename(file_path)
+        
+        # Disable buttons during upload
+        self.file_btn.setEnabled(False)
+        self.send_btn.setEnabled(False)
+        
+        # Add initial message
         self.add_message(f"📎 Uploading: {filename}...", False, save_to_db=False)
 
         try:
@@ -597,46 +674,83 @@ class ChatWindow(QWidget):
             shutil.copy(file_path, dest_path)
 
             file_type = safe_filename.split(".")[-1].lower()
-            file_id = save_file_metadata(
-                self.current_session_id, filename, dest_path, file_type
+            
+            # Start file processor worker in background
+            self.file_worker = FileProcessorWorker(
+                self.current_session_id, 
+                dest_path, 
+                file_type, 
+                filename
             )
-
-            chunks = process_file(dest_path, file_type)
-
-            if chunks:
-                success = add_document_chunks(
-                    self.current_session_id, file_id, filename, chunks
-                )
-
-                if success:
-                    mark_file_processed(file_id)
-                    self.add_file_to_ui(filename)
-
-                    last_item = self.chat_layout.itemAt(self.chat_layout.count() - 2)
-                    if last_item and last_item.widget():
-                        last_item.widget().deleteLater()
-
-                    self.add_message(
-                        f"✅ File uploaded successfully!\n{filename} is ready for questions ({len(chunks)} chunks processed)",
-                        False,
-                        save_to_db=False,
-                    )
-                else:
-                    self.add_message(
-                        f"❌ Failed to process embeddings for {filename}",
-                        False,
-                        save_to_db=False,
-                    )
-            else:
-                self.add_message(
-                    f"⚠️ Could not extract text from {filename}",
-                    False,
-                    save_to_db=False,
-                )
+            self.file_worker.progress.connect(self.on_file_progress)
+            self.file_worker.status_update.connect(self.on_file_status_update)
+            self.file_worker.finished.connect(self.on_file_upload_finished)
+            self.file_worker.error.connect(self.on_file_upload_error)
+            self.file_worker.start()
 
         except Exception as e:
             self.add_message(f"❌ Upload failed: {str(e)}", False, save_to_db=False)
-            print(f"File upload error: {e}")
+            self.file_btn.setEnabled(True)
+            self.send_btn.setEnabled(True)
+
+    def on_file_progress(self, percent):
+        """Update progress bar percentage"""
+        # Update the last message with progress
+        if self.chat_layout.count() > 1:
+            last_item = self.chat_layout.itemAt(self.chat_layout.count() - 2)
+            if last_item and last_item.widget():
+                # Extract filename from current message
+                bubble = last_item.widget()
+                # We'll update via status instead to avoid complex message parsing
+                pass
+
+    def on_file_status_update(self, status):
+        """Update status message during file processing"""
+        # Replace the previous status message
+        if self.chat_layout.count() > 1:
+            last_item = self.chat_layout.itemAt(self.chat_layout.count() - 2)
+            if last_item and last_item.widget():
+                last_item.widget().deleteLater()
+        
+        self.add_message(status, False, save_to_db=False)
+
+    def on_file_upload_finished(self, success):
+        """Handle file upload completion"""
+        # Remove the "Finalizing..." message
+        if self.chat_layout.count() > 1:
+            last_item = self.chat_layout.itemAt(self.chat_layout.count() - 2)
+            if last_item and last_item.widget():
+                last_item.widget().deleteLater()
+        
+        if success:
+            # Show final success message
+            self.add_message(
+                f"✅ File uploaded successfully!\nFile is ready for questions.",
+                False,
+                save_to_db=False,
+            )
+            # Refresh the files UI
+            self.load_uploaded_files_ui()
+        
+        # Re-enable buttons
+        self.file_btn.setEnabled(True)
+        self.send_btn.setEnabled(True)
+        self.input.setFocus()
+
+    def on_file_upload_error(self, error_msg):
+        """Handle file upload error"""
+        # Remove the processing message
+        if self.chat_layout.count() > 1:
+            last_item = self.chat_layout.itemAt(self.chat_layout.count() - 2)
+            if last_item and last_item.widget():
+                last_item.widget().deleteLater()
+        
+        self.add_message(error_msg, False, save_to_db=False)
+        
+        # Re-enable buttons
+        self.file_btn.setEnabled(True)
+        self.send_btn.setEnabled(True)
+        self.input.setFocus()
 
     def add_file_to_ui(self, filename):
         """Add file badge to the files container"""

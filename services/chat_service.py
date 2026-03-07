@@ -9,20 +9,38 @@ from services.llm_service import (
     OLLAMA_THINKING_MODEL,
 )
 from utils.config import (
-    SYSTEM_PROMPT,
     MAX_HISTORY_MESSAGES_NO_FILES,
     MAX_HISTORY_MESSAGES_WITH_FILES,
     MAX_RAG_CHUNKS,
 )
 from utils.helpers import estimate_tokens
 
-# Seed exchange for the 270m fast model — anchors GemServe identity on fresh sessions
+# ── System prompts ────────────────────────────────────────────────────────────
+
+_SYSTEM_THINKING = """You are GemServe, an offline AI desktop assistant built for a Final Year Project.
+
+Rules you must follow:
+- Your name is GemServe. Never say you are Gemma, an AI language model, or any other name.
+- Answer only what the user asks. Do not add unrequested information.
+- If you don't know something, say "I don't know" — do not make up facts.
+- Only greet the user on the very first message of a session.
+- Be clear and concise."""
+
+_SYSTEM_FAST = """You are GemServe, an offline AI desktop assistant.
+Your name is GemServe. Never say you are Gemma.
+Answer concisely. Do not make up facts."""
+
+# Seed exchange so 270m model continues as GemServe from the start
 _FAST_SEED = [
-    {"role": "user",      "content": "Who are you?"},
-    {"role": "assistant", "content": "I'm GemServe, your offline AI desktop assistant. How can I help?"},
+    {"role": "user", "content": "Who are you?"},
+    {
+        "role": "assistant",
+        "content": "I'm GemServe, your offline AI desktop assistant. How can I help?",
+    },
 ]
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 def _get_user_name() -> str | None:
     try:
@@ -42,11 +60,12 @@ def _get_user_notes() -> str | None:
 
 # ── Message builders ──────────────────────────────────────────────────────────
 
+
 def build_messages_thinking(session_id: str, user_query: str) -> list:
     messages = []
 
-    # System prompt from config
-    system = SYSTEM_PROMPT
+    # System
+    system = _SYSTEM_THINKING
     name = _get_user_name()
     if name:
         system += f"\nThe user's name is {name}."
@@ -63,30 +82,39 @@ def build_messages_thinking(session_id: str, user_query: str) -> list:
                 f"[From {chunks['metadatas'][0][i]['filename']}]\n{chunk}"
                 for i, chunk in enumerate(chunks["documents"][0])
             )
-            messages.append({"role": "system", "content": f"Document context:\n{rag_text}"})
+            messages.append(
+                {
+                    "role": "system",
+                    "content": f"Document context (use only if relevant):\n{rag_text}",
+                }
+            )
 
-    # Chat history
-    limit = MAX_HISTORY_MESSAGES_WITH_FILES if check_session_has_files(session_id) else MAX_HISTORY_MESSAGES_NO_FILES
+    # History
+    limit = (
+        MAX_HISTORY_MESSAGES_WITH_FILES
+        if check_session_has_files(session_id)
+        else MAX_HISTORY_MESSAGES_NO_FILES
+    )
     for role, content, _ in get_session_messages(session_id, limit=limit):
         messages.append({"role": role, "content": content})
 
     messages.append({"role": "user", "content": user_query})
 
-    print(f"📊 Thinking tokens: ~{estimate_tokens(' '.join(m['content'] for m in messages))}")
+    print(
+        f"📊 Thinking tokens: ~{estimate_tokens(' '.join(m['content'] for m in messages))}"
+    )
     return messages
 
 
 def build_messages_fast(session_id: str, user_query: str) -> list:
     messages = []
 
-    # System prompt from config
-    system = SYSTEM_PROMPT
+    system = _SYSTEM_FAST
     name = _get_user_name()
     if name:
         system += f"\nThe user's name is {name}."
     messages.append({"role": "system", "content": system})
 
-    # Seed on fresh session, history otherwise
     history = get_session_messages(session_id, limit=4)
     if not history:
         messages.extend(_FAST_SEED)
@@ -96,11 +124,14 @@ def build_messages_fast(session_id: str, user_query: str) -> list:
 
     messages.append({"role": "user", "content": user_query})
 
-    print(f"📊 Fast tokens: ~{estimate_tokens(' '.join(m['content'] for m in messages))}")
+    print(
+        f"📊 Fast tokens: ~{estimate_tokens(' '.join(m['content'] for m in messages))}"
+    )
     return messages
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
+
 
 def get_chat_response(session_id, user_query: str, mode: str = "fast") -> str:
     if mode == "thinking":

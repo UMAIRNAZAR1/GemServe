@@ -2,9 +2,9 @@ from db.todo_db_helper import insert_task, init_database, delete_task, get_all_t
 from utils.extract_info import extract_info
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QScrollArea, QFrame, QCheckBox
+    QLineEdit, QScrollArea, QFrame, QCheckBox, QDateEdit, QTimeEdit
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QDate, QTime, QTimer
 from datetime import datetime
 
 # Initialize database
@@ -13,6 +13,7 @@ init_database()
 
 class TodoList(QWidget):
     task_updated = Signal()
+    
     def __init__(self, go_back):
         super().__init__()
 
@@ -27,6 +28,42 @@ class TodoList(QWidget):
 
         self.build_ui()
         self.load_tasks()
+        
+        # ⭐ Setup auto-refresh timer (checks every 10 seconds for database changes)
+        self.refresh_timer = QTimer()
+        self.refresh_timer.timeout.connect(self.check_for_updates)
+        self.refresh_timer.start(10000)  # 10 seconds = 10000 milliseconds
+        
+        # ⭐ Setup time constraint update timer (updates every minute to keep time limit current)
+        self.time_update_timer = QTimer()
+        self.time_update_timer.timeout.connect(self.update_current_time_constraint)
+        self.time_update_timer.start(60000)  # 60 seconds = 1 minute
+
+    def check_for_updates(self):
+        """Check if database has changed and refresh UI if needed"""
+        try:
+            tasks = get_all_tasks()
+            current_count = len(tasks)
+            
+            # Count completed tasks
+            completed_count = sum(1 for task in tasks if int(task[5]) == 1)
+            current_state = (current_count, completed_count)
+            
+            # Compare with last known state
+            if not hasattr(self, 'last_state'):
+                self.last_state = current_state
+                return
+                
+            if current_state != self.last_state:
+                self.load_tasks()  # Refresh the UI
+                self.last_state = current_state
+        except Exception as e:
+            print(f"Error checking for updates: {e}")
+
+    def update_current_time_constraint(self):
+        """Update time constraint every minute if today's date is selected"""
+        if self.date_input.date() == QDate.currentDate():
+            self.time_input.setMinimumTime(QTime.currentTime())
 
     def build_ui(self):
         # Header Section
@@ -120,7 +157,6 @@ class TodoList(QWidget):
         # Input Section
         input_frame = QFrame()
         input_frame.setObjectName("inputFrame")
-        input_frame.setFixedHeight(70)
         
         input_layout = QHBoxLayout(input_frame)
         input_layout.setContentsMargins(0, 0, 0, 0)
@@ -132,17 +168,55 @@ class TodoList(QWidget):
         self.add_button.setCursor(Qt.PointingHandCursor)
         self.add_button.clicked.connect(self.create_task)
         
+        # Title Input
         self.task_input = QLineEdit()
         self.task_input.setObjectName("taskInput")
-        self.task_input.setPlaceholderText("Add a new task... (e.g., Meeting at 2025-01-01 03:00 pm)")
+        self.task_input.setPlaceholderText("Task title...")
         self.task_input.setFixedHeight(55)
         self.task_input.returnPressed.connect(self.create_task)
         
-        input_layout.addWidget(self.add_button)
-        input_layout.addWidget(self.task_input)
+        # Date Input
+        self.date_input = QDateEdit()
+        self.date_input.setObjectName("dateInput")
+        self.date_input.setCalendarPopup(True)
+        self.date_input.setDate(QDate.currentDate())
+        self.date_input.setMinimumDate(QDate.currentDate())
+        self.date_input.setDisplayFormat("yyyy-MM-dd")
+        self.date_input.setFixedHeight(55)
+        self.date_input.setCursor(Qt.PointingHandCursor)
+        self.date_input.dateChanged.connect(self.update_time_limit)
+
+        # Time Input
+        self.time_input = QTimeEdit()
+        self.time_input.setObjectName("timeInput")
+        self.time_input.setTime(QTime.currentTime())
+        self.time_input.setDisplayFormat("hh:mm AP")
+        self.time_input.setFixedHeight(55)
+        self.time_input.setCursor(Qt.PointingHandCursor)
+        # ⭐ Disable up/down arrow buttons
+        self.time_input.setButtonSymbols(QTimeEdit.NoButtons)
         
+        # ⭐ Set initial time constraint for today (blocks past time)
+        self.time_input.setMinimumTime(QTime.currentTime())
+        
+        input_layout.addWidget(self.add_button)
+        input_layout.addWidget(self.task_input, 2)
+        input_layout.addWidget(self.date_input, 1)
+        input_layout.addWidget(self.time_input, 1)
+
         content_layout.addWidget(input_frame)
         self.main_layout.addWidget(content)
+
+    def update_time_limit(self, selected_date):
+        """Prevent selecting past time for today, allow any time for future dates"""
+        today = QDate.currentDate()
+
+        if selected_date == today:
+            # Today → block past time (with current time, not static)
+            self.time_input.setMinimumTime(QTime.currentTime())
+        else:
+            # Future date → allow any time
+            self.time_input.setMinimumTime(QTime(0, 0))
 
     def apply_dark_mode(self, enabled):
         self.dark_mode = enabled
@@ -275,6 +349,69 @@ class TodoList(QWidget):
                 QLineEdit#taskInput::placeholder {
                     color: #64748B;
                     font-style: italic;
+                }
+                
+                /* Date and Time Inputs */
+                QDateEdit#dateInput, QTimeEdit#timeInput {
+                    background: rgba(30, 41, 59, 0.6);
+                    color: #E2E8F0;
+                    border: 2.5px solid rgba(139, 92, 246, 0.25);
+                    border-radius: 27px;
+                    padding: 0 20px;
+                    font-size: 15px;
+                    font-weight: 500;
+                }
+                QDateEdit#dateInput:focus, QTimeEdit#timeInput:focus {
+                    border: 2.5px solid #8B5CF6;
+                }
+                QDateEdit::drop-down, QTimeEdit::drop-down {
+                    border: none;
+                    width: 30px;
+                }
+                QDateEdit::down-arrow, QTimeEdit::down-arrow {
+                    image: none;
+                    border-left: 5px solid transparent;
+                    border-right: 5px solid transparent;
+                    border-top: 6px solid #8B5CF6;
+                    margin-right: 8px;
+                }
+                
+                /* Calendar Widget */
+                QCalendarWidget {
+                    background: rgba(15, 23, 42, 0.95);
+                    color: #E2E8F0;
+                    border: 2px solid rgba(139, 92, 246, 0.3);
+                    border-radius: 12px;
+                }
+                QCalendarWidget QToolButton {
+                    color: #E2E8F0;
+                    background: transparent;
+                    border: none;
+                    padding: 5px;
+                }
+                QCalendarWidget QToolButton:hover {
+                    background: rgba(139, 92, 246, 0.2);
+                    border-radius: 6px;
+                }
+                QCalendarWidget QMenu {
+                    background: rgba(15, 23, 42, 0.95);
+                    color: #E2E8F0;
+                    border: 1px solid rgba(139, 92, 246, 0.3);
+                }
+                QCalendarWidget QSpinBox {
+                    background: rgba(30, 41, 59, 0.6);
+                    color: #E2E8F0;
+                    border: 1px solid rgba(139, 92, 246, 0.3);
+                    padding: 3px;
+                }
+                QCalendarWidget QAbstractItemView:enabled {
+                    color: #E2E8F0;
+                    background: transparent;
+                    selection-background-color: rgba(139, 92, 246, 0.4);
+                    selection-color: #FFFFFF;
+                }
+                QCalendarWidget QAbstractItemView:disabled {
+                    color: #475569;
                 }
                 
                 /* Task Items */
@@ -434,6 +571,69 @@ class TodoList(QWidget):
                     font-style: italic;
                 }
                 
+                /* Date and Time Inputs */
+                QDateEdit#dateInput, QTimeEdit#timeInput {
+                    background: #FFFFFF;
+                    color: #0F172A;
+                    border: 2.5px solid rgba(226, 232, 240, 0.8);
+                    border-radius: 27px;
+                    padding: 0 20px;
+                    font-size: 15px;
+                    font-weight: 500;
+                }
+                QDateEdit#dateInput:focus, QTimeEdit#timeInput:focus {
+                    border: 2.5px solid #8B5CF6;
+                }
+                QDateEdit::drop-down, QTimeEdit::drop-down {
+                    border: none;
+                    width: 30px;
+                }
+                QDateEdit::down-arrow, QTimeEdit::down-arrow {
+                    image: none;
+                    border-left: 5px solid transparent;
+                    border-right: 5px solid transparent;
+                    border-top: 6px solid #8B5CF6;
+                    margin-right: 8px;
+                }
+                
+                /* Calendar Widget */
+                QCalendarWidget {
+                    background: #FFFFFF;
+                    color: #0F172A;
+                    border: 2px solid rgba(139, 92, 246, 0.2);
+                    border-radius: 12px;
+                }
+                QCalendarWidget QToolButton {
+                    color: #0F172A;
+                    background: transparent;
+                    border: none;
+                    padding: 5px;
+                }
+                QCalendarWidget QToolButton:hover {
+                    background: rgba(139, 92, 246, 0.1);
+                    border-radius: 6px;
+                }
+                QCalendarWidget QMenu {
+                    background: #FFFFFF;
+                    color: #0F172A;
+                    border: 1px solid rgba(139, 92, 246, 0.2);
+                }
+                QCalendarWidget QSpinBox {
+                    background: #FFFFFF;
+                    color: #0F172A;
+                    border: 1px solid rgba(226, 232, 240, 0.8);
+                    padding: 3px;
+                }
+                QCalendarWidget QAbstractItemView:enabled {
+                    color: #0F172A;
+                    background: transparent;
+                    selection-background-color: rgba(139, 92, 246, 0.3);
+                    selection-color: #FFFFFF;
+                }
+                QCalendarWidget QAbstractItemView:disabled {
+                    color: #94A3B8;
+                }
+                
                 /* Task Items */
                 QFrame#taskItem {
                     background: rgba(248, 250, 252, 0.8);
@@ -487,16 +687,25 @@ class TodoList(QWidget):
         self.load_tasks()
 
     def create_task(self):
-        raw_text = self.task_input.text().strip()
-        if not raw_text:
+        # Get values from separate inputs
+        title = self.task_input.text().strip()
+        if not title:
             return
 
-        title, task_date, task_time = extract_info(raw_text)
-        task_time = datetime.strptime(task_time, "%I:%M %p").strftime("%I:%M %p")
+        # Get date in YYYY-MM-DD format
+        task_date = self.date_input.date().toString("yyyy-MM-dd")
+        
+        # Get time in HH:MM AM/PM format
+        task_time = self.time_input.time().toString("hh:mm AP")
 
         insert_task(title, task_date, task_time)
         self.task_updated.emit()
         self.task_input.clear()
+        # Reset date and time to current values
+        self.date_input.setDate(QDate.currentDate())
+        self.time_input.setTime(QTime.currentTime())
+        # ⭐ Reset time constraint when resetting to today
+        self.time_input.setMinimumTime(QTime.currentTime())
         self.load_tasks()
 
     def refresh_page(self):
@@ -569,9 +778,14 @@ class TodoList(QWidget):
         self.task_updated.emit()
         self.load_tasks()
 
-    
     def delete_task(self, task_id):
         """Delete a task from the database"""
         delete_task(task_id)
         self.task_updated.emit()
         self.load_tasks()
+    
+    def closeEvent(self, event):
+        """Stop the timer when widget is closed"""
+        if hasattr(self, 'refresh_timer'):
+            self.refresh_timer.stop()
+        event.accept()

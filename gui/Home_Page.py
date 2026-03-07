@@ -1,21 +1,22 @@
 # gui/Home_Page.py
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QScrollArea, QCheckBox
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QScrollArea, QCheckBox, QMessageBox
 )
 from PySide6.QtGui import QPixmap, QIcon, QPainter, QPainterPath, QColor
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, Signal, QTimer
 import json
 import os
 from datetime import datetime
-from PySide6.QtCore import Signal
 from db.todo_db_helper import get_all_tasks, update_task_status
 from gui.edit_task_page import EditTaskPage
-from db import get_all_sessions
+from db import get_all_sessions, delete_session
+from db.vector_store import delete_session_collection
 
 DATA_FILE = "user_data.json"
 
 class HomePage(QWidget):
     task_status_changed = Signal()
+    
     def __init__(self, go_to_settings, go_to_tasks, go_to_chatbot, open_chat_session):
         super().__init__()
         self.go_to_settings = go_to_settings
@@ -27,6 +28,30 @@ class HomePage(QWidget):
         self.setup_ui()
         self.load_chat_sessions()
         self.load_task_rows(self.task_layout)
+        
+        # ⭐ Setup auto-refresh timer (checks every 10 seconds for database changes)
+        self.refresh_timer = QTimer()
+        self.refresh_timer.timeout.connect(self.check_for_updates)
+        self.refresh_timer.start(10000)  # 10 seconds
+
+    def check_for_updates(self):
+        """Check if database has changed and refresh UI if needed"""
+        try:
+            all_tasks = get_all_tasks()
+            # Filter only pending tasks (is_done == 0)
+            tasks = [t for t in all_tasks if t[5] == 0]
+            current_count = len(tasks)
+            
+            # Compare with last known state
+            if not hasattr(self, 'last_task_count'):
+                self.last_task_count = current_count
+                return
+                
+            if current_count != self.last_task_count:
+                self.refresh_tasks()  # Refresh the UI
+                self.last_task_count = current_count
+        except Exception as e:
+            print(f"Error checking for updates on home page: {e}")
 
     def setup_ui(self):
         # Overall container layout
@@ -146,6 +171,46 @@ class HomePage(QWidget):
     def refresh_chat_sessions(self):
         self.load_chat_sessions()
 
+    def delete_chat_session(self, session_id, title):
+        """Delete a chat session with confirmation"""
+        # Show confirmation dialog
+        reply = QMessageBox.question(
+            self,
+            "Delete Chat",
+            f"Are you sure you want to delete this chat?\n\n'{title}'\n\nThis action cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            try:
+                # Delete from database
+                delete_session(session_id)
+                
+                # Delete vector store collection
+                delete_session_collection(session_id)
+                
+                print(f"✅ Chat session {session_id} deleted successfully")
+                
+                # Refresh the chat list
+                self.refresh_chat_sessions()
+                
+                # Show success message
+                QMessageBox.information(
+                    self,
+                    "Chat Deleted",
+                    f"'{title}' has been deleted.",
+                    QMessageBox.Ok
+                )
+            except Exception as e:
+                print(f"❌ Error deleting chat: {e}")
+                QMessageBox.warning(
+                    self,
+                    "Error",
+                    f"Failed to delete chat: {str(e)}",
+                    QMessageBox.Ok
+                )
+
     def load_chat_sessions(self):
         while self.chat_buttons_layout.count():
             item = self.chat_buttons_layout.takeAt(0)
@@ -158,12 +223,29 @@ class HomePage(QWidget):
             self.chat_buttons_layout.addWidget(lbl, alignment=Qt.AlignCenter)
         else:
             for session_id, title, updated_at in sessions:
+                # Create a container for chat row with delete button
+                row_container = QWidget()
+                row_layout = QHBoxLayout(row_container)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(8)
+                
+                # Chat button
                 btn = QPushButton(f"  {title}")
                 btn.setObjectName("chatRow")
-                btn.setFixedHeight(50) 
+                btn.setFixedHeight(50)
                 btn.setCursor(Qt.PointingHandCursor)
                 btn.clicked.connect(lambda checked, sid=session_id: self.open_chat_session(sid))
-                self.chat_buttons_layout.addWidget(btn)
+                row_layout.addWidget(btn)
+                
+                # Delete button (X)
+                delete_btn = QPushButton("✕")
+                delete_btn.setObjectName("chatDeleteBtn")
+                delete_btn.setFixedSize(40, 50)
+                delete_btn.setCursor(Qt.PointingHandCursor)
+                delete_btn.clicked.connect(lambda checked, sid=session_id, title=title: self.delete_chat_session(sid, title))
+                row_layout.addWidget(delete_btn)
+                
+                self.chat_buttons_layout.addWidget(row_container)
         self.chat_buttons_layout.addStretch()
 
     def load_task_rows(self, layout):
@@ -242,6 +324,12 @@ class HomePage(QWidget):
             painter.end()
             self.profile_button.setIcon(QIcon(canvas))
             self.profile_button.setIconSize(QSize(85, 85))
+    
+    def closeEvent(self, event):
+        """Stop the timer when widget is closed"""
+        if hasattr(self, 'refresh_timer'):
+            self.refresh_timer.stop()
+        event.accept()
 
     def apply_dark_mode(self, enabled):
         self.dark_mode = enabled
@@ -385,7 +473,24 @@ class HomePage(QWidget):
                     border: 1px solid rgba(139, 92, 246, 0.4);
                 }
                 
-                QWidget#taskRow { 
+                QPushButton#chatDeleteBtn {
+                    background: rgba(220, 38, 38, 0.1);
+                    border-radius: 8px;
+                    border: 1px solid rgba(220, 38, 38, 0.3);
+                    color: #FCA5A5;
+                    font-weight: bold;
+                    font-size: 18px;
+                }
+                QPushButton#chatDeleteBtn:hover {
+                    background: rgba(220, 38, 38, 0.3);
+                    border: 1px solid rgba(220, 38, 38, 0.6);
+                    color: #FEE2E2;
+                }
+                QPushButton#chatDeleteBtn:pressed {
+                    background: rgba(220, 38, 38, 0.5);
+                }
+                
+                QWidget#taskRow {
                     background: rgba(30, 41, 59, 0.4);
                     border-radius: 16px; 
                     border: 1px solid rgba(71, 85, 105, 0.3); 
@@ -555,7 +660,24 @@ class HomePage(QWidget):
                     border: 1.5px solid rgba(139, 92, 246, 0.3);
                 }
                 
-                QWidget#taskRow { 
+                QPushButton#chatDeleteBtn {
+                    background: rgba(254, 226, 226, 0.5);
+                    border-radius: 8px;
+                    border: 1px solid rgba(220, 38, 38, 0.3);
+                    color: #991B1B;
+                    font-weight: bold;
+                    font-size: 18px;
+                }
+                QPushButton#chatDeleteBtn:hover {
+                    background: rgba(254, 226, 226, 0.8);
+                    border: 1px solid rgba(220, 38, 38, 0.6);
+                    color: #7F1D1D;
+                }
+                QPushButton#chatDeleteBtn:pressed {
+                    background: rgba(220, 38, 38, 0.4);
+                }
+                
+                QWidget#taskRow {
                     background: rgba(255, 255, 255, 0.8);
                     border-radius: 16px; 
                     border: 1.5px solid rgba(226, 232, 240, 0.8); 
