@@ -8,50 +8,49 @@ DB_PATH = os.path.join(DATA_DIR, "chat.db")
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploaded_files")
 LOG_FILE = os.path.join(DATA_DIR, "app.log")
 
-# Create directories if they don't exist
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ==================== LLM SETTINGS ====================
 OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_MODEL = "gemma3:270m"  # Main chat model - change to "gemma3n:e2b" if you prefer
+OLLAMA_FAST_MODEL = "gemma3:270m"
+OLLAMA_THINKING_MODEL = "gemma3n:e2b"
+OLLAMA_MODEL = OLLAMA_FAST_MODEL  # backward-compat alias
 
 # ==================== EMBEDDING SETTINGS ====================
-EMBEDDING_MODEL = "embeddinggemma:latest"  # For document embeddings
+EMBEDDING_MODEL = "embeddinggemma:latest"
 
 # ==================== CONTEXT WINDOW SETTINGS ====================
-# Token limits for Gemma models (32k total context)
 MAX_TOTAL_TOKENS = 32000
 SYSTEM_PROMPT_TOKENS = 500
 USER_PREFS_TOKENS = 200
 RESERVED_RESPONSE_TOKENS = 8000
 
-# Context limits without files
 MAX_HISTORY_MESSAGES_NO_FILES = 30
 MAX_HISTORY_TOKENS_NO_FILES = 8000
-
-# Context limits with files (RAG enabled)
 MAX_HISTORY_MESSAGES_WITH_FILES = 15
 MAX_HISTORY_TOKENS_WITH_FILES = 4000
 MAX_RAG_CHUNKS = 8
-MAX_CHUNK_TOKENS = 1800  # ~15k / 8 chunks
+MAX_CHUNK_TOKENS = 1800
 
 # ==================== CHUNKING SETTINGS ====================
-CHUNK_SIZE = 1800  # tokens per chunk
-CHUNK_OVERLAP = 200  # overlap between chunks
+CHUNK_SIZE = 1800
+CHUNK_OVERLAP = 200
 
 # ==================== CHROMADB SETTINGS ====================
 CHROMA_PERSIST_DIR = os.path.join(DATA_DIR, "chroma_db")
 os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
 
 # ==================== SYSTEM PROMPT ====================
-SYSTEM_PROMPT = """You are an offline AI desktop assistant named GemServe.
+# NOTE: chat_service.py now uses its own inline system prompts via /api/chat.
+# This constant is kept for any legacy code that still imports it.
+SYSTEM_PROMPT = """Your name is GemServe. You are an offline AI desktop assistant.
+Never say your name is Gemma or any other name — you are GemServe.
 You help users with file management, tasks, reminders, and general queries.
-Be concise, helpful, and friendly in your responses.
+Be concise, helpful, and friendly.
 When answering questions about uploaded documents, reference the specific information provided in the context."""
 
 # ==================== THEME COLORS ====================
-# Light Mode Colors
 LIGHT_MODE = {
     "bg_primary": "#f0f0f0",
     "bg_secondary": "#ffffff",
@@ -68,7 +67,6 @@ LIGHT_MODE = {
     "accent_green": "#4CAF50",
 }
 
-# Dark Mode Colors
 DARK_MODE = {
     "bg_primary": "#1e1e1e",
     "bg_secondary": "#2d2d2d",

@@ -66,38 +66,13 @@ def get_all_drives():
     return drives
 
 
-def initialize_file_mode():
-    """Initialize file operation mode and return intro info"""
-    drives = get_all_drives()
-    drives_text = "\n".join(f"  • {d}" for d in drives) if drives else "  No drives found"
-    
-    intro_message = (
-        "📁 File Operation Mode Activated\n\n"
-        "🖥️ Available Drives:\n"
-        f"{drives_text}\n\n"
-        "📋 Available Commands:\n"
-        "  • open <filename>   - Search and open file\n"
-        "  • delete <filename> - Search and delete file\n"
-        "  • new <filename>    - Create file (choose Desktop or custom path)\n\n"
-        "💡 Tips:\n"
-        "  • Use partial names: 'README' finds 'README.md', 'README.txt'\n"
-        "  • First 15 recently opened files are cached for faster access\n"
-        "  • When cache limit reached, you can search all drives or specific drive"
-    )
-    
-    return {
-        "status": "init",
-        "message": intro_message,
-        "drives": drives
-    }
-
-
 def search_in_cache(session_id, filename):
     """Search for file in user's cache first"""
     cache = load_file_cache(session_id)
     files = cache.get("files", [])
     
     user_name, user_ext = os.path.splitext(filename.lower())
+    user_norm = user_name.replace('_', ' ').replace('-', ' ')
     matches = []
     
     for file_path in files:
@@ -106,13 +81,18 @@ def search_in_cache(session_id, filename):
         
         file_name = os.path.basename(file_path)
         name, ext = os.path.splitext(file_name.lower())
-        
-        if user_ext:
-            if name.startswith(user_name) and ext == user_ext:
-                matches.append(file_path)
-        else:
-            if name.startswith(user_name):
-                matches.append(file_path)
+        name_norm = name.replace('_', ' ').replace('-', ' ')
+
+        ext_ok = (not user_ext) or (ext == user_ext)
+        if not ext_ok:
+            continue
+
+        if (name == user_name or
+                name.startswith(user_name) or
+                name_norm.startswith(user_norm) or
+                user_name in name or
+                user_norm in name_norm):
+            matches.append(file_path)
     
     return matches
 
@@ -170,16 +150,40 @@ def find_files_by_name(filename, session_id=None, specific_drive=None, max_depth
         all_drives = get_all_drives()
 
     def file_matches(file):
-        """Check if file matches search criteria with partial matching"""
+        """Check if file matches search criteria with partial matching.
+        Tries exact, startswith, and contains — so 'Talha' finds 'Muhammd_Talha_Resume.pdf'.
+        Also normalises spaces↔underscores so 'Talha DMC' matches 'Talha_DMC.pdf'.
+        """
         name, ext = os.path.splitext(file)
-        name, ext = name.lower(), ext.lower()
-        
+        name_lower = name.lower()
+        ext_lower  = ext.lower()
+
+        # Normalise: treat spaces and underscores as equivalent
+        name_norm    = name_lower.replace('_', ' ').replace('-', ' ')
+        user_norm    = user_name.replace('_', ' ').replace('-', ' ')
+
         if user_ext:
-            if user_name and name.startswith(user_name) and ext == user_ext:
+            if ext_lower != user_ext:
+                return False
+            # 1. exact match
+            if name_lower == user_name:
                 return True
-            return file.lower() == user_filename.lower()
-        
-        return name.startswith(user_name)
+            # 2. starts with
+            if name_lower.startswith(user_name) or name_norm.startswith(user_norm):
+                return True
+            # 3. contains (handles "Talha" inside "Muhammd_Talha_Resume")
+            if user_name in name_lower or user_norm in name_norm:
+                return True
+            return False
+
+        # No extension filter — match on name only
+        if name_lower == user_name:
+            return True
+        if name_lower.startswith(user_name) or name_norm.startswith(user_norm):
+            return True
+        if user_name in name_lower or user_norm in name_norm:
+            return True
+        return False
 
     # Search priority paths first (unless specific drive specified)
     if not specific_drive:
