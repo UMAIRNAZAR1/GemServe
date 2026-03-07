@@ -1,5 +1,6 @@
 # services/llm_file_service.py
 import re
+import json
 from services.file_service import (
     open_file,
     delete_file,
@@ -7,138 +8,94 @@ from services.file_service import (
     find_files_by_name,
     search_in_cache,
 )
+from services.llm_service import _call_ollama
 
 
 # ---------------------------------------------------------------------------
-# Intent detection — no LLM needed, regex is fast and reliable for this task
+# LLM-based intent parsing  (fast model, short prompt, 15s timeout)
 # ---------------------------------------------------------------------------
 
-# Action keyword groups
-_OPEN_WORDS = r"\b(open|launch|start|show|view|display|run|access|load)\b"
-_DELETE_WORDS = r"\b(delete|remove|trash|erase|get rid of|wipe)\b"
-_CREATE_WORDS = r"\b(create|make|new|generate|touch|add)\b"
-_SEARCH_WORDS = r"\b(find|search|locate|look for|where is|where are|list)\b"
+_INTENT_PROMPT = """You are a file operation intent extractor. Given a user message, extract:
+1. action: one of "open", "delete", "create", "search", or "none"
+2. filename: the file or name mentioned (or null if none)
 
-# Patterns that strongly suggest a FILE is being referenced
-# e.g. "notes.txt", "my resume", "the file called X", "a file named X"
-_FILE_HINT = r"(\.\w{2,5}|(?:file|document|folder|photo|image|video)\s+(?:called|named|titled)?\s*\S+|my\s+\S+)"
+Rules:
+- "open", "show", "view", "launch", "display", "load", "access" → action: "open"
+- "delete", "remove", "trash", "erase", "get rid of", "wipe" → action: "delete"
+- "create", "make", "new file", "generate", "touch" → action: "create"
+- "find", "search", "locate", "look for", "where is", "list" → action: "search"
+- For filename: extract ONLY the file/name part, no action words
+- If no file operation is intended (e.g. "how are you", "write a poem"), use action: "none"
+
+Respond ONLY with a JSON object, no explanation:
+{"action": "open", "filename": "resume.pdf"}
+
+Examples:
+"Can you please open my resume?" → {"action": "open", "filename": "resume"}
+"I need to see the DMC certificate" → {"action": "open", "filename": "DMC"}
+"Get rid of that old notes file" → {"action": "delete", "filename": "notes"}
+"Could you find Talha's resume?" → {"action": "search", "filename": "Talha resume"}
+"Show me where my photos are" → {"action": "search", "filename": "photos"}
+"Create a new file called report" → {"action": "create", "filename": "report"}
+"What is the weather today?" → {"action": "none", "filename": null}
+
+User message: "{message}"
+JSON:"""
 
 
-def _extract_filename(text: str) -> str | None:
+def _llm_parse_intent(text: str) -> dict:
     """
-    Extract a filename from a natural language message.
-    Handles:
-      - "Open Muhammd_Talha_Resume.pdf"   → "Muhammd_Talha_Resume.pdf"
-      - "Open Talha DMC.pdf"              → "Talha DMC.pdf"
-      - "Delete notes.txt"                → "notes.txt"
-      - "Find my resume"                  → "resume"
-      - bare "README.md"                  → "README.md"
+    Use the fast LLM (270m) to extract file operation intent.
+    Falls back to regex if LLM fails or times out.
     """
-    # Step 1: strip leading action verb + optional articles so we work on just the name part
-    # e.g. "Open the file Muhammd_Talha_Resume.pdf" → "Muhammd_Talha_Resume.pdf"
-    cleaned = re.sub(
-        r"^(?:open|delete|remove|trash|erase|create|make|find|search|locate|launch|show|view|look\s+for)\s+"
-        r"(?:the\s+|my\s+|a\s+|me\s+)?(?:file\s+)?",
-        "",
-        text.strip(),
-        flags=re.I,
-    )
+    from utils.config import OLLAMA_FAST_MODEL
 
-    # Step 2: if what remains contains an extension, grab everything up to that extension
-    # This correctly handles spaces and underscores: "Talha DMC.pdf" or "Muhammd_Talha_Resume.pdf"
-    m = re.search(r"^([\w\-. ]+?\.\w{2,5})\b", cleaned)
-    if m:
-        return m.group(1).strip()
+    try:
+        prompt = _INTENT_PROMPT.replace("{message}", text)
+        response = _call_ollama(prompt, OLLAMA_FAST_MODEL, timeout=15).strip()
 
-    # Step 3: quoted string anywhere in original text — e.g. open "my notes"
-    m = re.search(r'["\']([^"\']+)["\']', text)
-    if m:
-        candidate = m.group(1).strip()
-        candidate = re.sub(
-            r"^(?:open|delete|remove|create|make|find|search|launch|show|view)\s+",
-            "",
-            candidate,
-            flags=re.I,
-        )
-        return candidate if candidate else None
+        # Extract JSON from response
+        # Try direct parse first
+        try:
+            result = json.loads(response)
+        except Exception:
+            # Find JSON object in response
+            m = re.search(r"\{[^{}]+\}", response)
+            if m:
+                result = json.loads(m.group())
+            else:
+                raise ValueError("No JSON found")
 
-    # Step 4: "file/document called/named X"
-    m = re.search(
-        r'(?:file|document|folder)\s+(?:called|named|titled)\s+"?([^"]+?)"?\s*$',
-        text,
-        re.I,
-    )
-    if m:
-        return m.group(1).strip()
+        action = result.get("action", "none").lower().strip()
+        filename = result.get("filename")
 
-    # Step 5: fallback — everything after the action verb (no extension found)
-    m = re.search(
-        r"(?:open|delete|remove|create|make|find|search|launch|show|view)\s+"
-        r"(?:the\s+|my\s+|a\s+)?([A-Za-z0-9_\-. ]{2,60}?)(?:\s+file|\s+document|$)",
-        text,
-        re.I,
-    )
-    if m:
-        candidate = m.group(1).strip()
-        if candidate.lower() not in (
-            "file",
-            "document",
-            "folder",
-            "me",
-            "it",
-            "this",
-            "",
-        ):
-            return candidate
+        # Normalise filename
+        if filename and str(filename).lower() in ("null", "none", ""):
+            filename = None
 
-    return None
+        if action in ("open", "delete", "create", "search"):
+            return {
+                "action": action,
+                "filename": filename,
+                "confidence": 0.9,
+                "source": "llm",
+            }
+
+    except Exception as e:
+        print(f"⚠️ LLM intent parse failed: {e} — falling back to regex")
+
+    # Fallback to regex
+    return _regex_parse_intent(text)
 
 
-def is_file_operation_request(text: str) -> tuple[bool, float]:
-    """
-    Determine whether the user's message is a file operation request.
-    Returns (is_file_op: bool, confidence: float).
-
-    Rules:
-    - Action word + file noun/extension  → confident yes
-    - Bare filename with extension (e.g. user replied "README.md") → yes if pending
-    - Generic sentences like "create a poem" → no
-    """
-    t = text.strip().lower()
-
-    has_action = bool(
-        re.search(
-            r"\b(?:open|launch|start|delete|remove|trash|erase|create|make|find|search|locate|look for|where is)\b",
-            t,
-        )
-    )
-
-    # Hard file reference: has a file extension
-    has_extension = bool(re.search(r"\.\w{2,5}\b", t))
-
-    # File noun: word "file", "document", "folder" etc.
-    has_file_noun = bool(
-        re.search(r"\b(?:file|document|folder|photo|image|video)\b", t)
-    )
-
-    # Case 1: action + (extension or file noun) → definite file op
-    if has_action and (has_extension or has_file_noun):
-        return True, 0.9
-
-    # Case 2: bare filename typed alone (user is replying with just "README.md")
-    # Only treat as file op if the entire message looks like a filename
-    if has_extension and re.fullmatch(r"[\w\-. ]+\.\w{2,5}", t.strip()):
-        return True, 0.85
-
-    return False, 0.0
-
-
-def parse_user_intent(text: str) -> dict:
-    """
-    Parse the user's message and return a structured intent dict.
-    Uses regex — fast, offline, no Ollama dependency.
-    """
+def _regex_parse_intent(text: str) -> dict:
+    """Regex fallback for when LLM is unavailable or times out."""
     t = text.lower().strip()
+
+    _DELETE_WORDS = r"\b(delete|remove|trash|erase|get rid of|wipe)\b"
+    _OPEN_WORDS = r"\b(open|launch|start|show|view|display|run|access|load)\b"
+    _CREATE_WORDS = r"\b(create|make|new|generate|touch|add)\b"
+    _SEARCH_WORDS = r"\b(find|search|locate|look for|where is|where are|list)\b"
 
     if re.search(_DELETE_WORDS, t):
         action = "delete"
@@ -148,15 +105,12 @@ def parse_user_intent(text: str) -> dict:
         action = "create"
     elif re.search(_SEARCH_WORDS, t):
         action = "search"
+    elif re.fullmatch(r"[\w\-. ]+\.\w{2,5}", t.strip()):
+        action = "open"  # bare filename → open
     else:
-        # No action word — if the whole message looks like a filename, default to open
-        if re.fullmatch(r"[\w\-. ]+\.\w{2,5}", t.strip()):
-            action = "open"
-        else:
-            action = "unknown"
+        action = "unknown"
 
-    filename = _extract_filename(text)  # preserve original casing
-
+    filename = _extract_filename(text)
     confidence = (
         0.9
         if (action != "unknown" and filename)
@@ -167,23 +121,220 @@ def parse_user_intent(text: str) -> dict:
         "action": action,
         "filename": filename,
         "confidence": confidence,
-        "reasoning": f"Detected action='{action}', filename='{filename}'",
+        "source": "regex",
     }
 
 
+def _extract_filename(text: str) -> str | None:
+    """Extract filename from text using regex strategies."""
+    # Strip leading action verb
+    cleaned = re.sub(
+        r"^(?:open|delete|remove|trash|erase|create|make|find|search|locate|"
+        r"launch|show|view|look\s+for|get\s+rid\s+of|i\s+need\s+to\s+see|"
+        r"can\s+you|please|could\s+you)\s+"
+        r"(?:the\s+|my\s+|a\s+|me\s+)?(?:file\s+)?",
+        "",
+        text.strip(),
+        flags=re.I,
+    )
+
+    # Has extension
+    m = re.search(r"^([\w\-. ]+?\.\w{2,5})\b", cleaned)
+    if m:
+        return m.group(1).strip()
+
+    # Quoted string
+    m = re.search(r'["\']([^"\']+)["\']', text)
+    if m:
+        candidate = re.sub(
+            r"^(?:open|delete|remove|create|make|find|search|launch|show|view)\s+",
+            "",
+            m.group(1).strip(),
+            flags=re.I,
+        )
+        return candidate or None
+
+    # "file/document called X"
+    m = re.search(
+        r'(?:file|document|folder)\s+(?:called|named|titled)\s+"?([^"]+?)"?\s*$',
+        text,
+        re.I,
+    )
+    if m:
+        return m.group(1).strip()
+
+    # Word after action verb
+    m = re.search(
+        r"(?:open|delete|remove|create|make|find|search|launch|show|view|see)\s+"
+        r"(?:the\s+|my\s+|a\s+)?([A-Za-z0-9_\-. ]{2,60}?)(?:\s+file|\s+document|$)",
+        text,
+        re.I,
+    )
+    if m:
+        candidate = m.group(1).strip()
+        _SKIP = {"file", "document", "folder", "me", "it", "this", "that", ""}
+        if candidate.lower() not in _SKIP:
+            return candidate
+
+    return None
+
+
 # ---------------------------------------------------------------------------
-# Smart file finder — tries multiple variants so spaces vs underscores don't matter
+# LLM-based routing  — uses the currently selected model to classify intent
+# Falls back to regex if the model times out or returns garbage
+# ---------------------------------------------------------------------------
+
+_ROUTE_PROMPT = """Classify this message. Reply with ONLY one word: FILE or CHAT.
+
+FILE = user wants to open, delete, create, find, or search for a specific file by name on their computer.
+CHAT = anything else — questions, summarizing/reading an uploaded file, general conversation, writing tasks.
+
+IMPORTANT: If the message says "this file", "the file", "uploaded file", or refers to content already in the conversation, that is CHAT not FILE.
+
+Examples:
+"open my resume" → FILE
+"delete notes.txt" → FILE
+"find Talha DMC" → FILE
+"create report.docx" → FILE
+"open the file called budget" → FILE
+"who are you" → CHAT
+"summarize this file" → CHAT
+"can you summarize this file?" → CHAT
+"what does this document say?" → CHAT
+"what is in the uploaded file?" → CHAT
+"explain the file I uploaded" → CHAT
+"write a poem" → CHAT
+"what is the weather" → CHAT
+"hello" → CHAT
+"I need to see my certificate" → FILE
+
+Message: "{message}"
+Answer:"""
+
+
+def is_file_operation_request(text: str, model: str = None) -> tuple[bool, float]:
+    """
+    Use the selected LLM to classify whether the message is a file operation.
+    Falls back to regex instantly if LLM fails or times out.
+
+    Args:
+        text  : user message
+        model : Ollama model name to use (from selected mode). If None, uses fast model.
+
+    Returns (is_file_op: bool, confidence: float)
+    """
+    from utils.config import OLLAMA_FAST_MODEL
+
+    if model is None:
+        model = OLLAMA_FAST_MODEL
+
+    # ── Early exit: message refers to already-uploaded/context file → always CHAT
+    _CONTEXT_RE = r"\b(this\s+file|the\s+file|uploaded\s+file|this\s+document|the\s+document|this\s+pdf|the\s+pdf|my\s+upload)\b"
+    if re.search(_CONTEXT_RE, text.lower()):
+        return False, 0.0
+
+    # ── Try LLM classification first ─────────────────────────────────────────
+    try:
+        prompt = _ROUTE_PROMPT.replace("{message}", text)
+        response = _call_ollama(prompt, model, timeout=30).strip().upper()
+
+        # Accept any response containing FILE or CHAT
+        if "FILE" in response:
+            return True, 0.95
+        if "CHAT" in response:
+            return False, 0.0
+
+        # Ambiguous response — fall through to regex
+        print(f"⚠️ Ambiguous routing response: '{response}' — using regex fallback")
+
+    except Exception as e:
+        print(f"⚠️ LLM routing failed: {e} — using regex fallback")
+
+    # ── Regex fallback ────────────────────────────────────────────────────────
+    return _regex_is_file_op(text)
+
+
+def _regex_is_file_op(text: str) -> tuple[bool, float]:
+    """Instant regex fallback for routing when LLM is unavailable."""
+    t = text.strip().lower()
+
+    # If message clearly refers to already-uploaded/context file → always CHAT
+    _CONTEXT_RE = r"\b(this\s+file|the\s+file|uploaded\s+file|this\s+document|the\s+document|this\s+pdf|the\s+pdf|my\s+upload)\b"
+    if re.search(_CONTEXT_RE, t):
+        return False, 0.0
+
+    _ACTION_RE = (
+        r"\b(?:open|launch|start|delete|remove|trash|erase|create|make|"
+        r"find|search|locate|look\s+for|where\s+is|get\s+rid\s+of|"
+        r"show\s+me|i\s+need\s+to\s+see|can\s+you\s+(?:open|find|delete|show))\b"
+    )
+    has_action = bool(re.search(_ACTION_RE, t))
+    has_extension = bool(re.search(r"\.\w{2,5}\b", t))
+    has_file_noun = bool(
+        re.search(
+            r"\b(?:file|document|folder|photo|image|video|certificate|resume|cv)\b", t
+        )
+    )
+    has_quotes = bool(re.search(r'["\'\']', t))
+
+    if has_action and (has_extension or has_file_noun or has_quotes):
+        return True, 0.9
+    if has_extension and re.fullmatch(r"[\w\-. ]+\.\w{2,5}", t.strip()):
+        return True, 0.85
+
+    _CHAT_WORDS = {
+        "me",
+        "something",
+        "anything",
+        "that",
+        "this",
+        "it",
+        "one",
+        "some",
+        "any",
+        "more",
+        "all",
+        "new",
+        "good",
+        "best",
+        "great",
+        "a",
+        "an",
+        "the",
+        "poem",
+        "story",
+        "joke",
+        "recipe",
+        "idea",
+        "example",
+        "way",
+        "help",
+        "info",
+        "you",
+    }
+    if has_action:
+        m = re.search(
+            r"\b(?:open|delete|remove|find|search|create|make|launch|start|show)\s+"
+            r"(?:the\s+|my\s+|a\s+)?(\w[\w\-. ]{1,40})",
+            t,
+        )
+        if m:
+            target = m.group(1).strip().split()[0]
+            if target not in _CHAT_WORDS and len(target) >= 3:
+                return True, 0.75
+
+    return False, 0.0
+
+
+# ---------------------------------------------------------------------------
+# Smart file finder
 # ---------------------------------------------------------------------------
 
 
 def _smart_find(filename: str, session_id=None) -> list:
     """
-    Search for a file trying multiple name variants:
-      1. Exact name as given          ("Talha DMC.pdf")
-      2. Spaces replaced by _         ("Talha_DMC.pdf")
-      3. _ replaced by spaces         ("Muhammd Talha Resume.pdf")
-      4. Each word fragment separately (finds "Muhammd_Talha_Resume.pdf" from "Talha")
-    Returns a deduplicated list of matching paths.
+    Search using multiple strategies so partial names and no-extension
+    queries still find the right file.
     """
     seen = set()
     found = []
@@ -194,34 +345,45 @@ def _smart_find(filename: str, session_id=None) -> list:
                 seen.add(p)
                 found.append(p)
 
-    # Split name and extension
     if "." in filename:
         dot_idx = filename.rfind(".")
         name_part = filename[:dot_idx]
-        ext_part = filename[dot_idx:]  # includes the dot, e.g. ".pdf"
+        ext_part = filename[dot_idx:]
     else:
         name_part = filename
         ext_part = ""
 
-    # Build variants
-    variants = set()
-    variants.add(filename)  # original
-    variants.add(name_part.replace(" ", "_") + ext_part)  # spaces -> underscore
-    variants.add(name_part.replace("_", " ") + ext_part)  # underscore -> spaces
+    # Strategy 1: exact + space/underscore variants
+    for v in {
+        filename,
+        name_part.replace(" ", "_") + ext_part,
+        name_part.replace("_", " ") + ext_part,
+    }:
+        _add(find_files_by_name(v, session_id=None)["files"])
 
-    for v in variants:
-        r = find_files_by_name(v, session_id=None)
-        _add(r["files"])
+    if found:
+        return found
 
-    # If still nothing, try each word fragment individually
-    if not found:
-        words = re.split(r"[\s_]+", name_part)
-        for word in words:
-            if len(word) >= 3:
-                r = find_files_by_name(word + ext_part, session_id=None)
-                _add(r["files"])
+    # Strategy 2: word fragments (with and without extension)
+    words = re.split(r"[\s_\-]+", name_part)
+    for word in words:
+        if len(word) >= 3:
+            for query in {word + ext_part, word}:
+                _add(find_files_by_name(query, session_id=None)["files"])
+
+    if found:
+        return found
+
+    # Strategy 3: bare name_part (no extension) — catches "resume" → "resume.pdf"
+    _add(find_files_by_name(name_part, session_id=None)["files"])
 
     return found
+
+
+# Public alias — kept for backwards compatibility with services/__init__.py
+def parse_user_intent(text: str) -> dict:
+    """Public wrapper around the LLM intent parser with regex fallback."""
+    return _llm_parse_intent(text)
 
 
 # ---------------------------------------------------------------------------
@@ -232,42 +394,34 @@ def _smart_find(filename: str, session_id=None) -> list:
 def handle_llm_file_command(user_prompt: str, session_id=None) -> dict:
     """
     Interpret a natural language file request and execute the appropriate
-    file_service function.
-
-    Returns:
-        status  : "success" | "error" | "select" | "confirm" | "ask_location" | "clarify"
-        message : Human-readable text to show in the chat bubble
-        action  : Inferred action string
-        data    : Extra payload (files list, filename, etc.)
+    file_service function. Uses LLM for intent parsing with regex fallback.
     """
-    intent = parse_user_intent(user_prompt)
+    intent = _llm_parse_intent(user_prompt)
+    action = intent["action"]
+    filename = intent["filename"]
 
-    if intent["confidence"] < 0.6 or intent["action"] == "unknown":
+    if action == "none" or (intent["confidence"] < 0.6 and action == "unknown"):
         return {
             "status": "clarify",
             "message": (
                 "🤔 I'm not sure which file operation you want.\n\n"
-                "You can say things like:\n"
-                "  • 'Open resume.pdf'\n"
+                "Try saying:\n"
+                "  • 'Open my resume'\n"
                 "  • 'Delete notes.txt'\n"
                 "  • 'Create report.docx'\n"
-                "  • 'Find photo.jpg'"
+                "  • 'Find my DMC certificate'"
             ),
             "action": None,
             "confidence": intent["confidence"],
         }
 
-    action = intent["action"]
-    filename = intent["filename"]
-
     if not filename:
         return {
             "status": "error",
             "message": (
-                f"❌ I understand you want to **{action}** a file, "
+                f"❌ I understand you want to {action} a file, "
                 "but I couldn't work out the filename.\n\n"
-                "Please include the filename, e.g.:\n"
-                f"  • '{action.capitalize()} notes.txt'"
+                f"Try: '{action.capitalize()} [filename]'"
             ),
             "action": action,
         }
@@ -275,7 +429,6 @@ def handle_llm_file_command(user_prompt: str, session_id=None) -> dict:
     # ---- OPEN ----
     if action == "open":
         cache_matches = search_in_cache(session_id, filename) if session_id else []
-
         if cache_matches:
             if len(cache_matches) == 1:
                 result = open_file(cache_matches[0], session_id)
@@ -305,7 +458,6 @@ def handle_llm_file_command(user_prompt: str, session_id=None) -> dict:
     # ---- DELETE ----
     elif action == "delete":
         cache_matches = search_in_cache(session_id, filename) if session_id else []
-
         if cache_matches:
             if len(cache_matches) == 1:
                 return _delete_confirm(cache_matches[0])
@@ -327,10 +479,10 @@ def handle_llm_file_command(user_prompt: str, session_id=None) -> dict:
         return {
             "status": "ask_location",
             "message": (
-                f"📝 Where should I create **'{filename}'**?\n\n"
+                f"📝 Where should I create '{filename}'?\n\n"
                 "  1️⃣  Desktop (default)\n"
                 "  2️⃣  Custom path\n\n"
-                "Type **1**, **2**, or **cancel**"
+                "Type 1, 2, or cancel"
             ),
             "action": "create",
             "data": {"filename": filename, "operation": "create"},
@@ -345,7 +497,6 @@ def handle_llm_file_command(user_prompt: str, session_id=None) -> dict:
                 "message": f"❌ No files matching '{filename}' found.",
                 "action": "search",
             }
-
         files_list = "\n".join(f"  {i}. {f}" for i, f in enumerate(files[:20], 1))
         extra = f"\n  … and {len(files) - 20} more" if len(files) > 20 else ""
         return {
@@ -370,7 +521,7 @@ def handle_llm_file_command(user_prompt: str, session_id=None) -> dict:
 def _delete_confirm(filepath: str) -> dict:
     return {
         "status": "confirm",
-        "message": f"🗑️ Delete this file?\n📂 {filepath}\n\nType **yes** to confirm or **no** to cancel",
+        "message": f"🗑️ Delete this file?\n📂 {filepath}\n\nType yes to confirm or no to cancel",
         "action": "delete",
         "data": {"files": [filepath], "operation": "delete"},
     }
@@ -382,8 +533,7 @@ def _multi_select_response(files: list, operation: str, filename: str) -> dict:
         "status": "select",
         "message": (
             f"📂 Found {len(files)} file(s) matching '{filename}'.\n\n"
-            f"{numbered}\n\n"
-            f"Enter the number to {operation}, or **cancel**"
+            f"{numbered}\n\nEnter the number to {operation}, or cancel"
         ),
         "action": operation,
         "data": {"files": files, "operation": operation, "filename": filename},
@@ -391,21 +541,17 @@ def _multi_select_response(files: list, operation: str, filename: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Follow-up response processor (user replies to a pending prompt)
+# Follow-up response processor
 # ---------------------------------------------------------------------------
 
 
 def process_file_response(response_text: str, pending_action: dict) -> dict:
-    """
-    Handle the user's reply to a multi-step file prompt
-    (file selection, delete confirmation, location choice, custom path).
-    """
+    """Handle user reply to multi-step file prompts."""
     state = pending_action.get("state", "select")
     files = pending_action.get("files", [])
     operation = pending_action.get("operation", "")
     r = response_text.strip().lower()
 
-    # ---- File selection ----
     if state == "select":
         if r in ("cancel", "c", "no"):
             return {
@@ -428,7 +574,7 @@ def process_file_response(response_text: str, pending_action: dict) -> dict:
                 elif operation == "delete":
                     return {
                         "status": "confirm",
-                        "message": f"🗑️ Delete this file?\n📂 {selected}\n\nType **yes** to confirm or **no** to cancel",
+                        "message": f"🗑️ Delete this file?\n📂 {selected}\n\nType yes to confirm or no to cancel",
                         "action": "delete_confirm",
                         "data": {"file": selected},
                         "handled": True,
@@ -445,11 +591,9 @@ def process_file_response(response_text: str, pending_action: dict) -> dict:
                 "handled": False,
             }
 
-    # ---- Delete confirmation ----
     elif state == "delete_confirm":
         if r in ("yes", "y"):
-            file_to_delete = pending_action.get("file")
-            result = delete_file(file_to_delete)
+            result = delete_file(pending_action.get("file"))
             return {
                 "status": result["status"],
                 "message": result["message"],
@@ -464,11 +608,10 @@ def process_file_response(response_text: str, pending_action: dict) -> dict:
             }
         return {
             "status": "error",
-            "message": "❌ Please type **yes** or **no**.",
+            "message": "❌ Please type yes or no.",
             "handled": False,
         }
 
-    # ---- Create — choose location ----
     elif state == "location":
         filename = pending_action.get("filename", "")
         if r in ("1", "desktop"):
@@ -482,7 +625,7 @@ def process_file_response(response_text: str, pending_action: dict) -> dict:
         elif r in ("2", "custom"):
             return {
                 "status": "ask_custom_path",
-                "message": "📁 Enter the full path where you want to create the file (or **cancel**):",
+                "message": "📁 Enter the full path (or cancel):",
                 "action": "create_custom",
                 "handled": True,
             }
@@ -494,11 +637,10 @@ def process_file_response(response_text: str, pending_action: dict) -> dict:
             }
         return {
             "status": "error",
-            "message": "❌ Please enter **1** for Desktop, **2** for custom path, or **cancel**.",
+            "message": "❌ Please enter 1, 2, or cancel.",
             "handled": False,
         }
 
-    # ---- Create — custom path provided ----
     elif state == "custom_path":
         if r in ("cancel", "c"):
             return {
@@ -506,8 +648,9 @@ def process_file_response(response_text: str, pending_action: dict) -> dict:
                 "message": "❌ Creation cancelled.",
                 "handled": True,
             }
-        filename = pending_action.get("filename", "")
-        result = create_file(filename, custom_path=response_text.strip())
+        result = create_file(
+            pending_action.get("filename", ""), custom_path=response_text.strip()
+        )
         return {
             "status": result["status"],
             "message": result["message"],
@@ -517,6 +660,6 @@ def process_file_response(response_text: str, pending_action: dict) -> dict:
 
     return {
         "status": "error",
-        "message": "❌ Unexpected state. Please try your request again.",
+        "message": "❌ Unexpected state. Please try again.",
         "handled": False,
     }

@@ -170,8 +170,7 @@ class LLMWorker(QThread):
 
     def run(self):
         try:
-            response = get_chat_response(self.session_id, self.user_query)
-            # Clean response - remove extra whitespace and newlines
+            response = get_chat_response(self.session_id, self.user_query, self.mode)
             cleaned_response = response.strip()
             self.finished.emit(cleaned_response)
         except Exception as e:
@@ -250,6 +249,35 @@ class FileProcessorWorker(QThread):
             self.finished.emit(False)
 
 
+# ---------------------- ROUTER WORKER THREAD -------------------------
+class RouterWorker(QThread):
+    """
+    Runs is_file_operation_request() in a background thread so the LLM
+    routing call never freezes the UI.
+
+    Emits:
+        finished(bool) — True if message is a file operation, False for chat
+        error(str)     — on exception (caller should default to chat)
+    """
+    finished = Signal(bool)
+    error    = Signal(str)
+
+    def __init__(self, text: str, mode: str = "fast"):
+        super().__init__()
+        self.text = text
+        self.mode = mode
+
+    def run(self):
+        try:
+            from services.llm_file_service import is_file_operation_request
+            from utils.config import OLLAMA_FAST_MODEL, OLLAMA_THINKING_MODEL
+            model = OLLAMA_THINKING_MODEL if self.mode == "thinking" else OLLAMA_FAST_MODEL
+            is_file, confidence = is_file_operation_request(self.text, model=model)
+            self.finished.emit(is_file and confidence > 0.5)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 # ----------------------- MAIN CHAT WINDOW ------------------------
 class ChatWindow(QWidget):
     def __init__(self, go_home_callback, home_page_refresh_callback):
@@ -259,7 +287,8 @@ class ChatWindow(QWidget):
         self.dark_mode = False
         self.current_session_id = None
         self.is_new_session = True
-        self.llm_worker = None
+        self.llm_worker    = None
+        self.router_worker = None
         
         # File operation mode state
         self.file_operation_mode = False
@@ -495,9 +524,15 @@ class ChatWindow(QWidget):
 
             elif result["status"] == "confirm":
                 # Need confirmation before proceeding
+                # Handle both {"file": x} (from select flow) and {"files": [x]} (from direct match)
+                data = result.get("data", {})
+                file_to_delete = (
+                    data.get("file") or
+                    (data.get("files", [None])[0] if data.get("files") else None)
+                )
                 self.pending_file_action = {
                     "state": "delete_confirm",
-                    "file": result["data"]["file"],
+                    "file": file_to_delete,
                     "operation": "delete",
                 }
                 self.add_message(result["message"], False, save_to_db=False)
@@ -595,28 +630,51 @@ class ChatWindow(QWidget):
             self.input.setFocus()
             return
 
-        # Check if this is a new file operation request
-        is_file_op, confidence = is_file_operation_request(text)
+        mode = self.get_selected_mode()
 
-        if is_file_op and confidence > 0.5:
+        # Route via LLM using the currently selected model
+        self.add_message("🔍 Routing...", False, save_to_db=False)
+        self.router_worker = RouterWorker(text, mode)
+        self.router_worker.finished.connect(lambda is_file: self._after_routing(text, mode, is_file))
+        self.router_worker.error.connect(lambda _: self._after_routing(text, mode, False))
+        self.router_worker.start()
+
+    def _after_routing(self, text: str, mode: str, is_file_op: bool):
+        """Called by RouterWorker once intent is classified."""
+        # Remove the "Routing..." bubble
+        last_item = self.chat_layout.itemAt(self.chat_layout.count() - 2)
+        if last_item and last_item.widget():
+            last_item.widget().deleteLater()
+
+        if is_file_op:
             self.handle_file_operation(text)
             self.input.setEnabled(True)
             self.send_btn.setEnabled(True)
             self.input.setFocus()
             return
 
-        # NORMAL CHAT MODE
+        # Normal chat
         self.add_message("Thinking...", False, save_to_db=False)
-
-        self.llm_worker = LLMWorker(self.current_session_id, text)
+        self.llm_worker = LLMWorker(self.current_session_id, text, mode)
         self.llm_worker.finished.connect(self.on_llm_response)
         self.llm_worker.error.connect(self.on_llm_error)
         self.llm_worker.start()
+
+    def process_text_input(self, text: str):
+        """
+        Central entry point for any text input — typed OR spoken.
+        Voice just calls this after speech-to-text; zero extra routing needed.
+        """
+        self.input.setText(text)
+        self.on_send()
 
     def on_llm_response(self, response):
         last_item = self.chat_layout.itemAt(self.chat_layout.count() - 2)
         if last_item and last_item.widget():
             last_item.widget().deleteLater()
+
+        if not response or not response.strip():
+            response = "⚠️ The model returned an empty response. Please try again."
 
         self.add_message(response, False, save_to_db=True)
 
@@ -636,7 +694,22 @@ class ChatWindow(QWidget):
         self.input.setFocus()
 
     def on_mic_click(self):
-        self.add_message("🎤 Voice input coming soon...", False, save_to_db=False)
+        """
+        Voice input handler.
+        When speech-to-text is added, replace the body with:
+
+            text = speech_to_text()        # e.g. using whisper / vosk
+            if text:
+                self.process_text_input(text)
+
+        process_text_input() routes through the same LLM router as
+        typed messages, so file ops and chat both work with zero extra code.
+        """
+        self.add_message(
+            "🎤 Voice input coming soon!"
+            "When ready, speech will route through the same pipeline as typed messages.",
+            False, save_to_db=False
+        )
 
     def on_file_upload(self):
         if not self.current_session_id:

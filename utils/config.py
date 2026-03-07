@@ -13,10 +13,13 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ==================== LLM SETTINGS ====================
 OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_MODEL = "gemma3:270m"  # Main chat model - change to "gemma3n:e2b" if you prefer
+OLLAMA_FAST_MODEL     = "gemma3:270m"
+OLLAMA_THINKING_MODEL = "gemma3n:e2b"
+OLLAMA_MODEL          = OLLAMA_FAST_MODEL   # backward-compat alias
 
 # ==================== EMBEDDING SETTINGS ====================
 EMBEDDING_MODEL = "embeddinggemma:latest"
+EMBEDDING_BATCH_SIZE = 10  # Number of chunks to embed in one batch
 
 # ==================== CONTEXT WINDOW SETTINGS ====================
 MAX_TOTAL_TOKENS = 32000
