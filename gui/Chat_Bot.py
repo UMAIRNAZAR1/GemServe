@@ -29,13 +29,18 @@ from db import (
     get_session_files,
 )
 from db.vector_store import add_document_chunks
-from services import get_chat_response, process_file
+from services import (
+    get_chat_response,
+    process_file,
+    handle_llm_file_command,
+    process_file_response,
+    is_file_operation_request,
+)
 from services.file_service import (
-    initialize_file_mode, 
-    handle_file_command, 
-    open_file, 
+    open_file,
     delete_file,
-    find_files_by_name
+    create_file,
+    find_files_by_name,
 )
 from utils.config import UPLOAD_DIR
 from utils.helpers import sanitize_filename
@@ -165,8 +170,7 @@ class LLMWorker(QThread):
 
     def run(self):
         try:
-            response = get_chat_response(self.session_id, self.user_query, mode=self.mode)
-            # Clean response - remove extra whitespace and newlines
+            response = get_chat_response(self.session_id, self.user_query, self.mode)
             cleaned_response = response.strip()
             self.finished.emit(cleaned_response)
         except Exception as e:
@@ -245,6 +249,35 @@ class FileProcessorWorker(QThread):
             self.finished.emit(False)
 
 
+# ---------------------- ROUTER WORKER THREAD -------------------------
+class RouterWorker(QThread):
+    """
+    Runs is_file_operation_request() in a background thread so the LLM
+    routing call never freezes the UI.
+
+    Emits:
+        finished(bool) — True if message is a file operation, False for chat
+        error(str)     — on exception (caller should default to chat)
+    """
+    finished = Signal(bool)
+    error    = Signal(str)
+
+    def __init__(self, text: str, mode: str = "fast"):
+        super().__init__()
+        self.text = text
+        self.mode = mode
+
+    def run(self):
+        try:
+            from services.llm_file_service import is_file_operation_request
+            from utils.config import OLLAMA_FAST_MODEL, OLLAMA_THINKING_MODEL
+            model = OLLAMA_THINKING_MODEL if self.mode == "thinking" else OLLAMA_FAST_MODEL
+            is_file, confidence = is_file_operation_request(self.text, model=model)
+            self.finished.emit(is_file and confidence > 0.5)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 # ----------------------- MAIN CHAT WINDOW ------------------------
 class ChatWindow(QWidget):
     def __init__(self, go_home_callback, home_page_refresh_callback):
@@ -254,8 +287,8 @@ class ChatWindow(QWidget):
         self.dark_mode = False
         self.current_session_id = None
         self.is_new_session = True
-        self.llm_worker = None
-        self.file_worker = None  # File processor worker
+        self.llm_worker    = None
+        self.router_worker = None
         
         # File operation mode state
         self.file_operation_mode = False
@@ -364,7 +397,6 @@ class ChatWindow(QWidget):
         self.mode_combo.setObjectName("modeCombo")
         self.mode_combo.addItem("⚡ Fast")
         self.mode_combo.addItem("🧠 Thinking")
-        self.mode_combo.addItem("📁 File Operation")
         self.mode_combo.setFixedSize(150, 36)
         self.mode_combo.setGeometry(50, 9, 150, 36)
         self.mode_combo.setCursor(Qt.PointingHandCursor)
@@ -397,22 +429,10 @@ class ChatWindow(QWidget):
     # Mode Management
     # -----------------------------------------
     def on_mode_changed(self):
-        """Handle mode change in dropdown"""
+        """Handle mode change (notification only)"""
         mode = self.get_selected_mode()
-        
-        if mode == "file_operation" and not self.file_operation_mode:
-            # Entering file operation mode
-            self.file_operation_mode = True
-            result = initialize_file_mode()
-            self.add_message(result["message"], False, save_to_db=False)
-            self.input.setPlaceholderText("Enter file command (e.g., open README.md)...")
-            
-        elif mode != "file_operation" and self.file_operation_mode:
-            # Exiting file operation mode
-            self.file_operation_mode = False
-            self.pending_file_action = None
-            self.add_message("📁 File Operation Mode Deactivated", False, save_to_db=False)
-            self.input.setPlaceholderText("Type your message...")
+        mode_name = "Fast Mode" if mode == "fast" else "Thinking Mode"
+        self.add_message(f"🔄 Switched to {mode_name}", False, save_to_db=False)
 
     def get_selected_mode(self):
         """Get current selected mode"""
@@ -421,8 +441,6 @@ class ChatWindow(QWidget):
             return "fast"
         elif "Thinking" in mode_text:
             return "thinking"
-        elif "File Operation" in mode_text:
-            return "file_operation"
         return "fast"
 
     # -----------------------------------------
@@ -432,7 +450,6 @@ class ChatWindow(QWidget):
         """Start a new chat session"""
         self.current_session_id = None
         self.is_new_session = True
-        self.file_operation_mode = False
         self.pending_file_action = None
         self.title.setText("New Chat")
         self.clear_chat()
@@ -444,7 +461,6 @@ class ChatWindow(QWidget):
         """Load an existing chat session"""
         self.current_session_id = session_id
         self.is_new_session = False
-        self.file_operation_mode = False
         self.pending_file_action = None
         self.clear_chat()
 
@@ -496,320 +512,93 @@ class ChatWindow(QWidget):
 
     # ---------------- FILE OPERATION HANDLER ----------------
     def handle_file_operation(self, text):
-        """Handle file operation commands"""
+        """Handle file operation commands using LLM for intent recognition"""
         # Check if this is a response to a pending action
         if self.pending_file_action:
-            action_type = self.pending_file_action.get("action")
-            
-            # Handle CACHE LIMIT response
-            if action_type in ["cache_limit_open", "cache_limit_delete"]:
-                user_response = text.strip().lower()
-                files = self.pending_file_action.get("files", [])
-                operation = "open" if action_type == "cache_limit_open" else "delete"
-                
-                # Check if user wants full search
-                if user_response == "all":
-                    self.add_message("🔍 Searching all drives...", False, save_to_db=False)
-                    filename = self.pending_file_action.get("filename")
-                    result = find_files_by_name(filename, session_id=None)
-                    
-                    if result["count"] == 0:
-                        self.add_message(f"❌ File '{filename}' not found in any drive", False, save_to_db=False)
-                        self.pending_file_action = None
-                    elif result["count"] == 1:
-                        if operation == "open":
-                            res = open_file(result["files"][0], self.current_session_id)
-                            self.add_message(res["message"], False, save_to_db=False)
-                        else:
-                            self.pending_file_action = {
-                                "action": "delete",
-                                "files": [result["files"][0]]
-                            }
-                            self.add_message(f"⚠️ Are you sure you want to delete:\n📂 {result['files'][0]}\n\nType 'y' to confirm or 'n' to cancel", False, save_to_db=False)
-                            return
-                        self.pending_file_action = None
-                    else:
-                        self.show_file_selection(result["files"], operation)
-                    return
-                
-                # Check if user specified a drive
-                elif user_response.endswith(":\\") or (len(user_response) == 1 and user_response.isalpha()):
-                    drive = user_response.upper()
-                    if not drive.endswith(":\\"):
-                        drive += ":\\"
-                    
-                    if not os.path.exists(drive):
-                        self.add_message(f"❌ Drive '{drive}' not found", False, save_to_db=False)
-                        return
-                    
-                    self.add_message(f"🔍 Searching {drive}...", False, save_to_db=False)
-                    filename = self.pending_file_action.get("filename")
-                    result = find_files_by_name(filename, session_id=self.current_session_id, specific_drive=drive)
-                    
-                    if result["count"] == 0:
-                        self.add_message(f"❌ File '{filename}' not found in {drive}", False, save_to_db=False)
-                        self.pending_file_action = None
-                    elif result["count"] == 1:
-                        if operation == "open":
-                            res = open_file(result["files"][0], self.current_session_id)
-                            self.add_message(res["message"], False, save_to_db=False)
-                        else:
-                            self.pending_file_action = {
-                                "action": "delete",
-                                "files": [result["files"][0]]
-                            }
-                            self.add_message(f"⚠️ Are you sure you want to delete:\n📂 {result['files'][0]}\n\nType 'y' to confirm or 'n' to cancel", False, save_to_db=False)
-                            return
-                        self.pending_file_action = None
-                    else:
-                        self.show_file_selection(result["files"], operation)
-                    return
-                
-                # Check if user selected a number from cache
-                else:
-                    try:
-                        choice = int(user_response)
-                        if 1 <= choice <= len(files):
-                            selected_file = files[choice - 1]
-                            
-                            if operation == "open":
-                                result = open_file(selected_file, self.current_session_id)
-                                self.add_message(result["message"], False, save_to_db=False)
-                            else:
-                                self.pending_file_action = {
-                                    "action": "delete",
-                                    "files": [selected_file]
-                                }
-                                self.add_message(f"⚠️ Are you sure you want to delete:\n📂 {selected_file}\n\nType 'y' to confirm or 'n' to cancel", False, save_to_db=False)
-                                return
-                            
-                            self.pending_file_action = None
-                        else:
-                            self.add_message(f"❌ Please enter a number between 1 and {len(files)}, 'all', or a drive letter", False, save_to_db=False)
-                            return
-                    except ValueError:
-                        self.add_message("❌ Invalid input. Enter a number, 'all', or drive letter (e.g., 'C:\\')", False, save_to_db=False)
-                    return
-            
-            # Handle DELETE confirmation
-            if action_type == "delete":
-                user_response = text.strip().lower()
-                
-                if user_response in ["y", "yes"]:
-                    files = self.pending_file_action.get("files", [])
-                    
-                    if len(files) == 1:
-                        result = delete_file(files[0], self.current_session_id)
-                        self.add_message(result["message"], False, save_to_db=False)
-                    else:
-                        # Ask user to select which file
-                        self.show_file_selection(files, "delete")
-                        return
-                        
-                    self.pending_file_action = None
-                    
-                elif user_response in ["n", "no", "c", "cancel"]:
-                    self.add_message("❌ Deletion cancelled", False, save_to_db=False)
-                    self.pending_file_action = None
-                else:
-                    self.add_message("❌ Invalid response. Please enter 'y' for yes or 'n' for no", False, save_to_db=False)
-                return
-                
-            # Handle OVERWRITE confirmation
-            elif action_type == "overwrite":
-                user_response = text.strip().lower()
-                
-                if user_response in ["y", "yes"]:
-                    path = self.pending_file_action.get("path")
-                    try:
-                        os.remove(path)
-                        from pathlib import Path
-                        Path(path).touch()
-                        self.add_message(f"✅ File overwritten: {os.path.basename(path)}", False, save_to_db=False)
-                    except Exception as e:
-                        self.add_message(f"❌ Failed to overwrite: {str(e)}", False, save_to_db=False)
-                    self.pending_file_action = None
-                    
-                elif user_response in ["n", "no", "c", "cancel"]:
-                    self.add_message("❌ File creation cancelled", False, save_to_db=False)
-                    self.pending_file_action = None
-                else:
-                    self.add_message("❌ Invalid response. Please enter 'y' for yes or 'n' for no", False, save_to_db=False)
-                return
-            
-            # Handle CREATE LOCATION selection
-            elif action_type == "create_location":
-                user_response = text.strip().lower()
-                filename = self.pending_file_action.get("filename")
-                
-                if user_response in ["1", "desktop"]:
-                    # Create on Desktop
-                    from services.file_service import create_file
-                    result = create_file(filename, custom_path=None)
-                    
-                    if result["status"] == "success":
-                        self.add_message(result["message"], False, save_to_db=False)
-                        self.pending_file_action = None
-                    elif result["status"] == "confirm":
-                        # File exists, ask to overwrite
-                        self.pending_file_action = {"action": "overwrite", "path": result["path"]}
-                        self.add_message(result["message"], False, save_to_db=False)
-                    else:
-                        self.add_message(result["message"], False, save_to_db=False)
-                        self.pending_file_action = None
-                    return
-                    
-                elif user_response in ["2", "custom"]:
-                    # Ask for custom path
-                    self.pending_file_action = {
-                        "action": "custom_path",
-                        "filename": filename
-                    }
-                    self.add_message("📂 Enter the full path where you want to create the file:\n(e.g., C:\\Users\\Me\\Documents or T:\\Projects)", False, save_to_db=False)
-                    return
-                    
-                elif user_response in ["c", "cancel", "q", "quit"]:
-                    self.add_message("❌ File creation cancelled", False, save_to_db=False)
-                    self.pending_file_action = None
-                else:
-                    self.add_message("❌ Invalid choice. Type '1' for Desktop, '2' for custom path, or 'cancel'", False, save_to_db=False)
-                return
-            
-            # Handle CUSTOM PATH input
-            elif action_type == "custom_path":
-                custom_path = text.strip()
-                filename = self.pending_file_action.get("filename")
-                
-                # Remove quotes if user added them
-                custom_path = custom_path.strip('"').strip("'")
-                
-                if custom_path.lower() in ["c", "cancel", "q", "quit"]:
-                    self.add_message("❌ File creation cancelled", False, save_to_db=False)
-                    self.pending_file_action = None
-                    return
-                
-                from services.file_service import create_file
-                result = create_file(filename, custom_path=custom_path)
-                
-                if result["status"] == "success":
-                    self.add_message(result["message"], False, save_to_db=False)
-                    self.pending_file_action = None
-                elif result["status"] == "confirm":
-                    # File exists, ask to overwrite
-                    self.pending_file_action = {"action": "overwrite", "path": result["path"]}
-                    self.add_message(result["message"], False, save_to_db=False)
-                else:
-                    self.add_message(result["message"], False, save_to_db=False)
-                    self.pending_file_action = None
-                return
-                
-            # Handle FILE SELECTION (by number)
-            elif action_type == "select_file":
-                files = self.pending_file_action.get("files", [])
-                operation = self.pending_file_action.get("operation")
-                
-                try:
-                    choice = int(text.strip())
-                    if 1 <= choice <= len(files):
-                        selected_file = files[choice - 1]
-                        
-                        if operation == "open":
-                            result = open_file(selected_file, self.current_session_id)
-                            self.add_message(result["message"], False, save_to_db=False)
-                        elif operation == "delete":
-                            # Confirm deletion
-                            self.pending_file_action = {
-                                "action": "delete",
-                                "files": [selected_file]
-                            }
-                            self.add_message(f"⚠️ Are you sure you want to delete:\n📂 {selected_file}\n\nType 'y' to confirm or 'n' to cancel", False, save_to_db=False)
-                            return
-                            
-                        self.pending_file_action = None
-                    else:
-                        self.add_message(f"❌ Please enter a number between 1 and {len(files)}", False, save_to_db=False)
-                        return
-                except ValueError:
-                    if text.strip().lower() in ["c", "cancel", "q", "quit"]:
-                        self.add_message("❌ Operation cancelled", False, save_to_db=False)
-                        self.pending_file_action = None
-                    else:
-                        self.add_message("❌ Invalid input. Enter a number or 'c' to cancel", False, save_to_db=False)
-                return
-        
-        # Process new file command
-        result = handle_file_command(text, self.current_session_id)
-        
+            pending_state = self.pending_file_action.get("state", "select")
+            result = process_file_response(text, self.pending_file_action)
+
+            if result["status"] == "success":
+                self.add_message(result["message"], False, save_to_db=False)
+                self.pending_file_action = None
+
+            elif result["status"] == "confirm":
+                # Need confirmation before proceeding
+                # Handle both {"file": x} (from select flow) and {"files": [x]} (from direct match)
+                data = result.get("data", {})
+                file_to_delete = (
+                    data.get("file") or
+                    (data.get("files", [None])[0] if data.get("files") else None)
+                )
+                self.pending_file_action = {
+                    "state": "delete_confirm",
+                    "file": file_to_delete,
+                    "operation": "delete",
+                }
+                self.add_message(result["message"], False, save_to_db=False)
+
+            elif result["status"] == "ask_location":
+                # Ask for custom path
+                self.pending_file_action = {
+                    "state": "location",
+                    "filename": self.pending_file_action.get("filename"),
+                    "operation": "create",
+                }
+                self.add_message(result["message"], False, save_to_db=False)
+
+            elif result["status"] == "ask_custom_path":
+                self.pending_file_action = {
+                    "state": "custom_path",
+                    "filename": self.pending_file_action.get("filename"),
+                    "operation": "create",
+                }
+                self.add_message(result["message"], False, save_to_db=False)
+
+            elif result["status"] == "error" and not result["handled"]:
+                self.add_message(result["message"], False, save_to_db=False)
+
+            return
+
+        # Process new file command using LLM
+        result = handle_llm_file_command(text, self.current_session_id)
+
         if result["status"] == "success":
             self.add_message(result["message"], False, save_to_db=False)
-            
+
         elif result["status"] == "error":
             self.add_message(result["message"], False, save_to_db=False)
-        
-        elif result["status"] == "single_file":
-            # Single file found, open directly
-            file_path = result["file"]
-            if result["action"] == "open":
-                res = open_file(file_path, self.current_session_id)
-                self.add_message(res["message"], False, save_to_db=False)
-        
-        elif result["status"] == "cache_limit":
-            # Cache found but under 15, ask user
-            self.pending_file_action = {
-                "action": f"cache_limit_{result['action']}",
-                "files": result["files"],
-                "filename": text.split(maxsplit=1)[1].strip()  # Extract filename
-            }
-            self.add_message(result["message"], False, save_to_db=False)
-        
-        elif result["status"] == "ask_location":
-            # Ask where to create file (Desktop or custom path)
-            self.pending_file_action = {
-                "action": "create_location",
-                "filename": result["filename"]
-            }
-            self.add_message(result["message"], False, save_to_db=False)
-            
-        elif result["status"] == "multiple":
-            # Multiple files found - ask user to select
-            self.show_file_selection(result["files"], result["action"])
-            
-        elif result["status"] == "confirm":
-            action = result["action"]
-            
-            if action == "delete":
-                # Ask for delete confirmation
-                files = result["files"]
-                if len(files) == 1:
-                    self.pending_file_action = {"action": "delete", "files": files}
-                    self.add_message(f"⚠️ Are you sure you want to delete:\n📂 {files[0]}\n\nType 'y' to confirm or 'n' to cancel", False, save_to_db=False)
-                else:
-                    self.show_file_selection(files, "delete")
-                    
-            elif action == "overwrite":
-                # Ask for overwrite confirmation
-                self.pending_file_action = {"action": "overwrite", "path": result["path"]}
-                self.add_message(result["message"], False, save_to_db=False)
-                
-        elif result["status"] == "warning":
-            # System file warning
-            self.pending_file_action = {"action": "delete", "files": [result["path"]]}
-            self.add_message(result["message"] + "\n\nType 'y' to confirm or 'n' to cancel", False, save_to_db=False)
 
-    def show_file_selection(self, files, operation):
-        """Show file selection menu"""
-        message = f"📊 Found {len(files)} file(s). Select one:\n\n"
-        for i, file in enumerate(files, 1):
-            message += f"{i}. {file}\n"
-        message += "\nEnter the number or 'c' to cancel"
-        
-        self.pending_file_action = {
-            "action": "select_file",
-            "files": files,
-            "operation": operation
-        }
-        
-        self.add_message(message, False, save_to_db=False)
+        elif result["status"] == "clarify":
+            # LLM wasn't confident about intent
+            self.add_message(result["message"], False, save_to_db=False)
+
+        elif result["status"] == "select":
+            # Multiple files found, ask user to select
+            self.pending_file_action = {
+                "state": "select",
+                "files": result["data"]["files"],
+                "operation": result["data"]["operation"],
+                "filename": result["data"]["filename"],
+            }
+            self.add_message(result["message"], False, save_to_db=False)
+
+        elif result["status"] == "confirm":
+            # Confirmation required before proceeding
+            self.pending_file_action = {
+                "state": "delete_confirm",
+                "file": result["data"]["files"][0] if result["data"]["files"] else None,
+                "operation": result["action"],
+            }
+            self.add_message(result["message"], False, save_to_db=False)
+
+        elif result["status"] == "ask_location":
+            # Ask where to create file
+            self.pending_file_action = {
+                "state": "location",
+                "filename": result["data"]["filename"],
+                "operation": "create",
+            }
+            self.add_message(result["message"], False, save_to_db=False)
 
     # ---------------- SEND MESSAGE ----------------
     def on_send(self):
@@ -832,28 +621,60 @@ class ChatWindow(QWidget):
         self.add_message(text, True, save_to_db=True)
         self.input.clear()
 
-        # FILE OPERATION MODE
-        if self.file_operation_mode:
+        # If mid-way through a file operation (e.g. waiting for "yes/no" or a number),
+        # always route back to the file handler — never send to the LLM.
+        if self.pending_file_action:
             self.handle_file_operation(text)
             self.input.setEnabled(True)
             self.send_btn.setEnabled(True)
             self.input.setFocus()
             return
 
-        # NORMAL CHAT MODE
-        self.add_message("Thinking...", False, save_to_db=False)
-
-        # Get the current mode (fast or thinking)
         mode = self.get_selected_mode()
-        self.llm_worker = LLMWorker(self.current_session_id, text, mode=mode)
+
+        # Route via LLM using the currently selected model
+        self.add_message("🔍 Routing...", False, save_to_db=False)
+        self.router_worker = RouterWorker(text, mode)
+        self.router_worker.finished.connect(lambda is_file: self._after_routing(text, mode, is_file))
+        self.router_worker.error.connect(lambda _: self._after_routing(text, mode, False))
+        self.router_worker.start()
+
+    def _after_routing(self, text: str, mode: str, is_file_op: bool):
+        """Called by RouterWorker once intent is classified."""
+        # Remove the "Routing..." bubble
+        last_item = self.chat_layout.itemAt(self.chat_layout.count() - 2)
+        if last_item and last_item.widget():
+            last_item.widget().deleteLater()
+
+        if is_file_op:
+            self.handle_file_operation(text)
+            self.input.setEnabled(True)
+            self.send_btn.setEnabled(True)
+            self.input.setFocus()
+            return
+
+        # Normal chat
+        self.add_message("Thinking...", False, save_to_db=False)
+        self.llm_worker = LLMWorker(self.current_session_id, text, mode)
         self.llm_worker.finished.connect(self.on_llm_response)
         self.llm_worker.error.connect(self.on_llm_error)
         self.llm_worker.start()
+
+    def process_text_input(self, text: str):
+        """
+        Central entry point for any text input — typed OR spoken.
+        Voice just calls this after speech-to-text; zero extra routing needed.
+        """
+        self.input.setText(text)
+        self.on_send()
 
     def on_llm_response(self, response):
         last_item = self.chat_layout.itemAt(self.chat_layout.count() - 2)
         if last_item and last_item.widget():
             last_item.widget().deleteLater()
+
+        if not response or not response.strip():
+            response = "⚠️ The model returned an empty response. Please try again."
 
         self.add_message(response, False, save_to_db=True)
 
@@ -873,7 +694,22 @@ class ChatWindow(QWidget):
         self.input.setFocus()
 
     def on_mic_click(self):
-        self.add_message("🎤 Voice input coming soon...", False, save_to_db=False)
+        """
+        Voice input handler.
+        When speech-to-text is added, replace the body with:
+
+            text = speech_to_text()        # e.g. using whisper / vosk
+            if text:
+                self.process_text_input(text)
+
+        process_text_input() routes through the same LLM router as
+        typed messages, so file ops and chat both work with zero extra code.
+        """
+        self.add_message(
+            "🎤 Voice input coming soon!"
+            "When ready, speech will route through the same pipeline as typed messages.",
+            False, save_to_db=False
+        )
 
     def on_file_upload(self):
         if not self.current_session_id:
