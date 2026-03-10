@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QComboBox
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QIcon
 import shutil
+from gui.speech_popup import open_speech_popup
 
 # Import database and services
 from db import (
@@ -287,6 +288,9 @@ class ChatWindow(QWidget):
         self.dark_mode = False
         self.current_session_id = None
         self.is_new_session = True
+        self.llm_worker = None
+        self.file_worker = None  # File processor worker
+        self._speech_popup = None
         self.llm_worker    = None
         self.router_worker = None
         
@@ -711,6 +715,14 @@ class ChatWindow(QWidget):
         self.input.setFocus()
 
     def on_mic_click(self):
+        from gui.speech_popup import SpeechPopup
+        if self._speech_popup is None:
+            self._speech_popup = SpeechPopup(self, whisper_model_dir="models/whisper")
+            self._speech_popup.text_ready.connect(self._on_voice_text)
+        self._speech_popup.show()
+
+    def _on_voice_text(self, text: str):
+        self.input.setText(text)
         """
         Voice input handler.
         When speech-to-text is added, replace the body with:
