@@ -1,20 +1,17 @@
 # services/chat_service.py
-from db.database import (
-    get_session_messages, 
-    check_session_has_files
-)
+import json
+import os
+from db.database import get_session_messages, check_session_has_files
 from db.vector_store import query_relevant_chunks
-from services.llm_service import ask_ollama
+from services.llm_service import (
+    _call_ollama_chat,
+    OLLAMA_FAST_MODEL,
+    OLLAMA_THINKING_MODEL,
+)
 from utils.config import (
-    SYSTEM_PROMPT,
     MAX_HISTORY_MESSAGES_NO_FILES,
     MAX_HISTORY_MESSAGES_WITH_FILES,
     MAX_RAG_CHUNKS,
-    FAST_MODE_HISTORY_MESSAGES_NO_FILES,
-    FAST_MODE_HISTORY_MESSAGES_WITH_FILES,
-    THINKING_MODE_HISTORY_MESSAGES_NO_FILES,
-    THINKING_MODE_HISTORY_MESSAGES_WITH_FILES,
-    DEFAULT_MODE
 )
 from utils.helpers import estimate_tokens
 from db.todo_db_helper import insert_task
@@ -25,55 +22,110 @@ import json
 import os
 import re
 
-def build_context_prompt(session_id, user_query, mode="fast"):
-    """
-    Build complete context prompt for LLM
-    Includes: system prompt + user prefs + chat history + RAG context + current query
-    Args:
-        session_id: Chat session ID
-        user_query: User's current query
-        mode: "fast" (less context) or "thinking" (more context)
-    """
-    prompt_parts = []
-    
-    # 1. System Prompt
-    prompt_parts.append(SYSTEM_PROMPT)
-    
-    # 2. User Preferences & Personalization
-    user_data_file = "user_data.json"
-    user_notes_file = "user_notes.json"
-    
-    # Load user data
-    if os.path.exists(user_data_file):
-        with open(user_data_file, 'r') as f:
-            user_data = json.load(f)
-            if user_data.get("name"):
-                prompt_parts.append(f"\nUser's name: {user_data['name']}")
-    
-    # Load user notes for personalization
-    if os.path.exists(user_notes_file):
-        with open(user_notes_file, 'r') as f:
-            user_notes = json.load(f)
-            notes_content = user_notes.get("notes", "").strip()
-            if notes_content:
-                prompt_parts.append("\n--- User Personalization Notes ---")
-                prompt_parts.append(notes_content)
-                prompt_parts.append("(Use this information to personalize responses and understand the user's preferences, context, and needs.)")
-    
-    # 3. Check if session has files
-    has_files = check_session_has_files(session_id)
-    
-    # 4. Chat History (limited based on file presence and mode)
-    # Get appropriate history limits based on mode
-    if mode == "thinking":
-        history_limit = THINKING_MODE_HISTORY_MESSAGES_WITH_FILES if has_files else THINKING_MODE_HISTORY_MESSAGES_NO_FILES
-    else:  # fast mode or default
-        history_limit = FAST_MODE_HISTORY_MESSAGES_NO_FILES if not has_files else FAST_MODE_HISTORY_MESSAGES_WITH_FILES
-    
-    history = get_session_messages(session_id, limit=history_limit)
-    
-    if history:
-        prompt_parts.append("\n--- Previous Conversation ---")
+# ── System prompts ────────────────────────────────────────────────────────────
+
+_SYSTEM_THINKING = """You are GemServe, an offline AI desktop assistant built for a Final Year Project.
+
+Rules you must follow:
+- Your name is GemServe. Never say you are Gemma, an AI language model, or any other name.
+- Answer only what the user asks. Do not add unrequested information.
+- If you don't know something, say "I don't know" — do not make up facts.
+- Only greet the user on the very first message of a session.
+- Be clear and concise."""
+
+_SYSTEM_FAST = """You are GemServe, an offline AI desktop assistant.
+Your name is GemServe. Never say you are Gemma.
+Answer concisely. Do not make up facts."""
+
+# Seed exchange so 270m model continues as GemServe from the start
+_FAST_SEED = [
+    {"role": "user", "content": "Who are you?"},
+    {
+        "role": "assistant",
+        "content": "I'm GemServe, your offline AI desktop assistant. How can I help?",
+    },
+]
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _get_user_name() -> str | None:
+    try:
+        with open("user_data.json", "r") as f:
+            return json.load(f).get("name")
+    except Exception:
+        return None
+
+
+def _get_user_notes() -> str | None:
+    try:
+        with open("user_notes.json", "r") as f:
+            return json.load(f).get("notes", "").strip() or None
+    except Exception:
+        return None
+
+
+# ── Message builders ──────────────────────────────────────────────────────────
+
+
+def build_messages_thinking(session_id: str, user_query: str) -> list:
+    messages = []
+
+    # System
+    system = _SYSTEM_THINKING
+    name = _get_user_name()
+    if name:
+        system += f"\nThe user's name is {name}."
+    notes = _get_user_notes()
+    if notes:
+        system += f"\nUser notes: {notes}"
+    messages.append({"role": "system", "content": system})
+
+    # RAG context
+    if check_session_has_files(session_id):
+        chunks = query_relevant_chunks(session_id, user_query, n_results=MAX_RAG_CHUNKS)
+        if chunks and chunks["documents"][0]:
+            rag_text = "\n\n".join(
+                f"[From {chunks['metadatas'][0][i]['filename']}]\n{chunk}"
+                for i, chunk in enumerate(chunks["documents"][0])
+            )
+            messages.append(
+                {
+                    "role": "system",
+                    "content": f"Document context (use only if relevant):\n{rag_text}",
+                }
+            )
+
+    # History
+    limit = (
+        MAX_HISTORY_MESSAGES_WITH_FILES
+        if check_session_has_files(session_id)
+        else MAX_HISTORY_MESSAGES_NO_FILES
+    )
+    for role, content, _ in get_session_messages(session_id, limit=limit):
+        messages.append({"role": role, "content": content})
+
+    messages.append({"role": "user", "content": user_query})
+
+    print(
+        f"📊 Thinking tokens: ~{estimate_tokens(' '.join(m['content'] for m in messages))}"
+    )
+    return messages
+
+
+def build_messages_fast(session_id: str, user_query: str) -> list:
+    messages = []
+
+    system = _SYSTEM_FAST
+    name = _get_user_name()
+    if name:
+        system += f"\nThe user's name is {name}."
+    messages.append({"role": "system", "content": system})
+
+    history = get_session_messages(session_id, limit=4)
+    if not history:
+        messages.extend(_FAST_SEED)
+    else:
         for role, content, _ in history:
             prompt_parts.append(f"{role.capitalize()}: {content}")
     
@@ -330,3 +382,31 @@ def get_chat_response(session_id, user_query, mode="fast"):
 
 
 # ------------------------------ ZAID END -------------------------------------------------
+            messages.append({"role": role, "content": content})
+
+    messages.append({"role": "user", "content": user_query})
+
+    print(
+        f"📊 Fast tokens: ~{estimate_tokens(' '.join(m['content'] for m in messages))}"
+    )
+    return messages
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+
+def get_chat_response(session_id, user_query: str, mode: str = "fast") -> str:
+    if mode == "thinking":
+        messages = build_messages_thinking(session_id, user_query)
+        model, timeout = OLLAMA_THINKING_MODEL, 180
+    else:
+        messages = build_messages_fast(session_id, user_query)
+        model, timeout = OLLAMA_FAST_MODEL, 60
+
+    return _call_ollama_chat(messages, model, timeout)
+
+
+# Backward-compat alias
+def build_context_prompt(session_id, user_query: str) -> str:
+    messages = build_messages_thinking(session_id, user_query)
+    return "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in messages)
