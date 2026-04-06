@@ -17,6 +17,7 @@ temp/*
 test/*
 data/*
 user_data.json
+app_registry.json
 user_notes.json
 assets/*
 *.db

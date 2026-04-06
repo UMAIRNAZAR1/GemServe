@@ -47,7 +47,7 @@ from utils.config import UPLOAD_DIR
 from utils.helpers import sanitize_filename
 from gui.Chat_Bot_styles import get_chat_styles
 from services.chat_service import detect_todo_intent, handle_todo_intent
-
+from services.app_service import handle_app_command
 # ---------------------- MESSAGE BUBBLE -------------------------
 class MessageBubble(QFrame):
     def __init__(self, text, is_user, dark_mode=False):
@@ -639,6 +639,14 @@ class ChatWindow(QWidget):
             return
         # ---------- Zaid End ---------------------------------
 
+        # ✅ APP CONTROL — open app / close app / switch app
+        app_response = handle_app_command(text)
+        if app_response:
+            self.add_message(app_response, False, save_to_db=False)
+            self.input.setEnabled(True)
+            self.send_btn.setEnabled(True)
+            self.input.setFocus()
+            return
 
         # FILE OPERATION MODE
         if self.file_operation_mode:
