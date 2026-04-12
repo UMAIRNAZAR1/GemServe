@@ -1,5 +1,7 @@
 # utils/config.py
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 # ==================== PATHS ====================
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -13,9 +15,10 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ==================== LLM SETTINGS ====================
 OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_FAST_MODEL     = "gemma3:270m"
-OLLAMA_THINKING_MODEL = "gemma3n:e2b"
+OLLAMA_FAST_MODEL     = "gemma3:1b"
+OLLAMA_THINKING_MODEL = "gemma3:4b"
 OLLAMA_MODEL          = OLLAMA_FAST_MODEL   # backward-compat alias
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # ==================== EMBEDDING SETTINGS ====================
 EMBEDDING_MODEL = "embeddinggemma:latest"

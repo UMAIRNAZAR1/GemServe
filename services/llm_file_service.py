@@ -228,6 +228,10 @@ def is_file_operation_request(text: str, model: str = None) -> tuple[bool, float
     if model is None:
         model = OLLAMA_FAST_MODEL
 
+    # Web search is handled by the chat router, not the file router.
+    if text.lower().strip().startswith("search web "):
+        return False, 0.0
+
     # ── Early exit: message refers to already-uploaded/context file → always CHAT
     _CONTEXT_RE = r"\b(this\s+file|the\s+file|uploaded\s+file|this\s+document|the\s+document|this\s+pdf|the\s+pdf|my\s+upload)\b"
     if re.search(_CONTEXT_RE, text.lower()):

@@ -2,6 +2,7 @@
 import json
 import os
 import re
+from html import escape
 from datetime import datetime
 
 from db.database import get_session_messages, check_session_has_files
@@ -156,8 +157,17 @@ def build_messages_fast(session_id: str, user_query: str) -> list:
 
 
 def get_chat_response(session_id: str, user_query: str, mode: str = "fast") -> str:
-    # FIX: was defined 3 times; last two called undefined `ask_ollama`. Single
-    # authoritative version kept, routing to the correct builder and model.
+    # 1. Check for web search intent first.
+    is_search, search_query = detect_search_intent(user_query)
+    if is_search:
+        return handle_search_intent(search_query)
+
+    # 2. Existing todo intent check.
+    is_todo, todo_text = detect_todo_intent(user_query)
+    if is_todo:
+        return handle_todo_intent(todo_text)
+
+    # 3. Existing Ollama routing.
     if mode == "thinking":
         messages = build_messages_thinking(session_id, user_query)
         model, timeout = OLLAMA_THINKING_MODEL, 180
@@ -173,6 +183,42 @@ def build_context_prompt(session_id: str, user_query: str) -> str:
     # FIX: was defined twice; second definition called undefined symbols.
     messages = build_messages_thinking(session_id, user_query)
     return "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in messages)
+
+
+# ── Search helpers ───────────────────────────────────────────────────────────
+
+
+def detect_search_intent(user_query: str):
+    """Detects if user wants to search the web using 'search web <query>'."""
+    pattern = r'^search web\s+(.+)'
+    match = re.match(pattern, user_query.lower().strip())
+    if match:
+        return True, match.group(1).strip()
+    return False, None
+
+
+def handle_search_intent(query: str) -> str:
+    """Calls Gemini Search and formats the answer with references."""
+    from services.llm_service import call_gemini_search
+
+    result = call_gemini_search(query)
+    answer = result["answer"]
+    sources = result["sources"]
+
+    if not sources:
+        return answer
+
+    safe_answer = escape(str(answer)).replace("\n", "<br>")
+    ref_text = "<br><br><b style=\"font-size: 14px; color: #6366F1;\">[Refrences:]</b><br><br>"
+    for i, src in enumerate(sources, 1):
+        title = escape(str(src.get("title") or f"Refrence-{i}"))
+        uri = escape(str(src.get("uri") or ""))
+        if uri:
+            ref_text += f"&nbsp;&nbsp;<b>[Refrence-{i}]</b> <a href=\"{uri}\" style=\"color: #06B6D4; text-decoration: underline;\">{title}</a><br>"
+        else:
+            ref_text += f"&nbsp;&nbsp;<b>[Refrence-{i}]</b> {title}<br>"
+
+    return f"{safe_answer}{ref_text}"
 
 
 # ── Todo helpers ──────────────────────────────────────────────────────────────

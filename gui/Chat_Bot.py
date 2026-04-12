@@ -60,7 +60,12 @@ class MessageBubble(QFrame):
 
         bubble = QLabel(cleaned_text)
         bubble.setWordWrap(True)
-        bubble.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        if "<a href=" in cleaned_text.lower():
+            bubble.setTextFormat(Qt.RichText)
+        else:
+            bubble.setTextFormat(Qt.PlainText)
+        bubble.setOpenExternalLinks(True)
+        bubble.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
 
         badge = QLabel("You" if is_user else "AI")
         badge.setFixedSize(36, 36)
@@ -635,7 +640,20 @@ class ChatWindow(QWidget):
             return
 
         # ─────────────────────────────────────────────
-        # 3. FILE OPERATION MODE
+        # 3. WEB SEARCH CHECK
+        # Route 'search web ...' directly to chat so it bypasses file intent.
+        # ─────────────────────────────────────────────
+        if text.lower().strip().startswith("search web "):
+            mode = self.get_selected_mode()
+            self.add_message("Thinking...", False, save_to_db=False)
+            self.llm_worker = LLMWorker(self.current_session_id, text, mode)
+            self.llm_worker.finished.connect(self.on_llm_response)
+            self.llm_worker.error.connect(self.on_llm_error)
+            self.llm_worker.start()
+            return
+
+        # ─────────────────────────────────────────────
+        # 4. FILE OPERATION MODE
         # If mid-way through a file operation always route back to file handler
         # ─────────────────────────────────────────────
         if self.file_operation_mode:
@@ -647,7 +665,7 @@ class ChatWindow(QWidget):
                 return
 
         # ─────────────────────────────────────────────
-        # 4. ROUTE via LLM (file op vs normal chat)
+        # 5. ROUTE via LLM (file op vs normal chat)
         # ─────────────────────────────────────────────
         mode = self.get_selected_mode()
 
